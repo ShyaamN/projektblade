@@ -431,6 +431,7 @@ def select(
         result.reasons.append("diff_parse_failed")
         result.numbers = set(all_numbers)
         return result
+    single_file = len(changes) == 1
 
     validated: dict[str, str] = {}
     import_changes: set[str] = set()
@@ -443,7 +444,7 @@ def select(
             result.reasons.append(reason)
             result.numbers = set(all_numbers)
             return result
-        if len(changes) == 1:
+        if single_file:
             result.excluded = pinpoint.comment_free_tests(validated)
             if result.excluded:
                 result.reasons.append("parser_comment_free_inputs")
@@ -467,7 +468,7 @@ def select(
             if not changes:
                 return result
 
-    identity = [change for change in changes if _none_identity_edit(change)] if len(changes) == 1 else []
+    identity = [change for change in changes if _none_identity_edit(change)] if single_file else []
     if identity:
         result.reasons.append(f"none_identity:{len(identity)}")
         if len(identity) == len(changes):
@@ -476,7 +477,7 @@ def select(
 
     if pinpoint is not None:
         broad = []
-        allow_equivalence = len(changes) == 1
+        allow_equivalence = single_file
         for change in changes:
             if change.old_path == "sqlglot/serde.py" or (
                 change.old_path == change.new_path

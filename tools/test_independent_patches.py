@@ -84,13 +84,25 @@ def check_pytest(root, node):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", default="e525db5321a7acbe93c0994981f1047e929ba35f")
-    parser.add_argument("--case", action="append", choices=[c[0] for c in CASES])
+    by_case = {case[0]: case for case in CASES}
+    parser.add_argument("--case", action="append", choices=by_case)
+    parser.add_argument("--mixed", action="append", choices=by_case, nargs=2)
     args = parser.parse_args()
-    cases = [case for case in CASES if not args.case or case[0] in args.case]
+    singles = args.case or (list(by_case) if not args.mixed else [])
+    groups = {key: [by_case[key]] for key in singles}
+    for keys in args.mixed or ():
+        pair = [by_case[key] for key in keys]
+        if pair[0][1] == pair[1][1]:
+            parser.error("A mixed regression requires two distinct source files")
+        groups["mixed__" + "__".join(keys)] = pair
     test_path = ROOT / "sample/tests.json"
     tests = json.loads(test_path.read_text(encoding="utf-8"))["tests"]
     by_id = {test["id"]: test["number"] for test in tests}
     ms = {test["number"]: round(test["seconds"] * 1000) for test in tests}
+
+    def cost(workers):
+        return (max((sum(ms[n] for n in w) for w in workers), default=0) + 2000 * len(workers)) / 1000
+
     with TemporaryDirectory(prefix="projektblade-holdout-") as temp:
         tmp = Path(temp).resolve()
         if tmp.parent != Path(gettempdir()).resolve():
@@ -110,40 +122,49 @@ def main():
         for relative in ("sqlglot", "tests"):
             shutil.copytree(UPSTREAM / relative, checkout / relative,
                             ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache"))
-        for key, relative, old, new, _, _ in cases:
-            original = (checkout / relative).read_text(encoding="utf-8")
-            assert original.count(old) >= 1, key
-            updated = original.replace(old, new, 1)
-            patch = patch_for(relative, original, updated)
-            (data / "commits" / f"{key}.patch").write_text(patch, encoding="utf-8")
+        originals = {}
+        for key, cases in groups.items():
+            edits = []
+            for _, relative, old, new, _, _ in cases:
+                path = checkout / relative
+                originals[path] = path.read_bytes()
+                original = path.read_text(encoding="utf-8")
+                assert old in original, key
+                edits.append(patch_for(relative, original, original.replace(old, new, 1)))
+            (data / "commits" / f"{key}.patch").write_text("".join(edits), encoding="utf-8")
         before = selection(baseline, data)
         after = selection(ROOT, data)
-        for key, relative, old, new, node, expected in cases:
-            target = checkout / relative
-            original = target.read_bytes()
-            clean = check_pytest(checkout, node)
-            assert clean.returncode == 0, clean.stdout + clean.stderr
-            updated = original.decode("utf-8").replace("\r\n", "\n").replace(old, new, 1)
+        for key, cases in groups.items():
+            for _, _, _, _, node, _ in cases:
+                clean = check_pytest(checkout, node)
+                assert clean.returncode == 0, clean.stdout + clean.stderr
             try:
-                target.write_text(updated, encoding="utf-8")
-                broken = check_pytest(checkout, node)
+                for _, relative, old, new, _, _ in cases:
+                    path = checkout / relative
+                    original = path.read_text(encoding="utf-8")
+                    path.write_text(original.replace(old, new, 1), encoding="utf-8")
+                for name, _, _, _, node, expected in cases:
+                    broken = check_pytest(checkout, node)
+                    report = broken.stdout + broken.stderr
+                    number = by_id[node]
+                    previously_selected = any(number in worker for worker in before[key])
+                    currently_selected = any(number in worker for worker in after[key])
+                    if expected is None:
+                        assert broken.returncode == 0, report
+                        if len(cases) == 1:
+                            assert not after[key], key
+                        outcome = "pass -> pass"
+                    else:
+                        assert broken.returncode and expected in report, report
+                        assert currently_selected, f"Omitted failing test: {node}"
+                        outcome = "pass -> fail"
+                    print(f"{key}/{name}: {outcome}; previous inclusion={previously_selected}, "
+                          f"current inclusion={currently_selected}", flush=True)
             finally:
-                target.write_bytes(original)
-            report = broken.stdout + broken.stderr
-            number = by_id[node]
-            scheduled = lambda groups: number in {n for group in groups for n in group}
-            cost = lambda groups: (max((sum(ms[n] for n in w) for w in groups), default=0)
-                                   + 2000 * len(groups)) / 1000
-            if expected is None:
-                assert broken.returncode == 0 and not after[key], report
-                outcome = "pass -> pass"
-            else:
-                assert broken.returncode and expected in report, report
-                assert scheduled(after[key]), f"Omitted failing test: {node}"
-                outcome = "pass -> fail"
-            print(f"{key}: {outcome}; previous inclusion={scheduled(before[key])}, "
-                  f"current inclusion={scheduled(after[key])}; "
-                  f"schedule {cost(before[key]):.3f}s -> {cost(after[key]):.3f}s", flush=True)
+                for _, relative, _, _, _, _ in cases:
+                    path = checkout / relative
+                    path.write_bytes(originals[path])
+            print(f"{key}: schedule {cost(before[key]):.3f}s -> {cost(after[key]):.3f}s", flush=True)
 
 
 if __name__ == "__main__":

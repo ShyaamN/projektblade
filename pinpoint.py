@@ -603,18 +603,22 @@ class Index:
                     (self.expression_flag_sites, _EXPRESSION_FLAG), (self.show_flag_sites, _SHOW_FLAG),
                 ):
                     hits = (sites or {}).get(path, {}).get(line)
-                    if allow_equivalence and hits is not None and _boolean_flag_flip(
+                    # Observed consumers remain relevant in a mixed patch.
+                    # Only an empty inference needs the single-file guard.
+                    if hits is not None and (hits or allow_equivalence) and _boolean_flag_flip(
                         pattern, change.removed_bodies[0], change.added_bodies[0],
                     ):
                         return set(hits)
-                if allow_equivalence and self.tokenizer is not None:
+                if self.tokenizer is not None:
                     keys = _escape_keys(path, source, output, line)
                     if keys is not None:
                         # Class initialization and escaping output inspect only
                         # key presence. Decoder value reads are indexed by key.
-                        return set(self.tokenizer["unobserved"]) | {
+                        hits = set(self.tokenizer["unobserved"]) | {
                             n for key in keys for n in self.tokenizer["keys"].get(key, ())
                         }
+                        if hits or allow_equivalence:
+                            return hits
                 entry = _predicate_entry(source, output, line)
             except (SyntaxError, ValueError, TypeError):
                 return None
