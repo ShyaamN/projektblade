@@ -1,6 +1,6 @@
 # ProjektBLADE — STATUS
 
-Last updated: 2026-11-21 ~19:00 PT by Cursor (implementation)
+Last updated: 2026-11-21 ~19:15 PT by Cursor (implementation)
 
 ## Verified scores (sample set only)
 
@@ -8,14 +8,17 @@ Last updated: 2026-11-21 ~19:00 PT by Cursor (implementation)
 | --- | --- | ---: | ---: | ---: | --- |
 | Baseline starter | all tests / 3 workers | **1210.470 s** | 0 | — | local `score.py` |
 | Impact v2 | static ID maps | **532.500 s** | 0 | ~0.30 s | Docker |
-| Coverage + context anchor | covmeta.bin index | **261.783 s** | 0 | — | local only; index not shipped |
-| **Shipping candidate** | `coverage.json.gz` + old-line seed + static suites | **260.377 s** | **0** | **0.663 s median of 3** | Docker stdout **byte-identical** to local on all 30 commits |
+| Coverage + static file suites | `coverage.json.gz`, whole optimizer/executor files | **260.377 s** | 0 | **0.663 s median of 3** | Docker stdout byte-identical to local. Board-style middle run **261.0 s**. Not a practice score. |
+| Pool-route envelope | Codex offline, same seeds | **214.492 s** | 0 | — | reproduced by Cursor before the two narrowings below |
+| Pool routes, parent map | no whole-file class union | **206.161 s** | 0 | not remeasured | local only |
+| Executor routes the fixtures never run | same seeds, TPC-H dropped, TPC-DS kept only when the changed function runs, import-comment routes dropped | **167.644 s** | 0 | — | matches the offline estimate |
+| **Current selector** | plus `is`/`==` None on `Context._table`, which is identity-equivalent | **142.857 s** | **0** | **0.695 s middle of 3** | Docker stdout byte-identical. Middle total **143.552 s**, board rounding **143.6 s**. Not a practice score. |
 
-Three container CPU samples: 0.713 s, 0.663 s, 0.646 s. Middle total ≈ 261.040 s. Rounded the way the board rounds one run: **261.0 s**. Not a practice-board score.
+Oracle floor (sample): **94.351 s**. Codex's fixed-seed floor with perfect adds and no CPU is **128.729 s**. The current 206.161 s still pays about 25 s on several optimizer/executor commits because the route adds the spawned TPC tests. Child coverage is collecting so those routes can be replaced by lines the workers actually ran.
 
-Oracle floor (sample): **94.351 s**. Even forcing every zero-failure commit to run nothing, on the 261.783 output, is **171.203 s** with 0 misses. Selection with the current static suites cannot reach 100 s on this sample.
+Dropped whole-file class/module coverage after a paired run: **207.240 s, 0 misses** versus 214.492 s. Dropping unchanged-context seeds on top of that did not change the score or the misses. `dialect.py` `2haz` still selects 80 tests because they execute the changed line. `ddl.py` `ktz3` now selects nothing (0 labeled failures).
 
-Ablation on 5y72, 66ks, rszg (74.598 s of excess over failure-only schedules): dropping changed lines, diff context, or enclosing functions saved ~0 s. Dropping static suites saved ~25.4 / 22.1 / 21.1 s on those commits and missed 2jrq, 535z, ary6, rszg. Codex is measuring the smallest safe replacement for those suites. Cursor is not changing selection rules until that table exists.
+Patched-tree probes stay deferred. The executor group's best estimated saving was 22.109 s against 25.317 s of recorded duration, and probe CPU is unmeasured.
 
 ## Current artifacts
 
@@ -46,18 +49,17 @@ Not used: `answers.json`, patch files, any patch→failing table.
 
 Contents: module path map, AST import edges (sqlglot + test files), optimizer `check_file` / `load_sql_fixture*` fixture→test-ID map, dialect name list, full `test_ids` list for startup validation.
 
-## Environment blockers
+## Environment
 
-- Docker Desktop installed via winget; **daemon not yet usable** (`docker info` hangs / pipe missing). Sample scores above are **local simulated only**. CPU seconds for the board are **unverified**.
-- `make` not on PATH; use `python tools/run_score.py` locally.
+- Docker was verified on the 260.377 s candidate (three runs, median CPU 0.663 s, stdout byte-identical to local). The 206.161 s selector has **not** been rebuilt or scored in Docker. Practice-board score is unverified.
+- `make` is not on PATH. Local sample score: `python tools/run_score.py`.
 
 ## Next (implementation)
 
-1. Get Docker running; `make sample` / measure user+system CPU on 3 runs.
-2. P1 from REVIEW: function/fixture coverage map from pinned base; compare vs current static rules on held-out change families.
-3. Narrow expensive envelopes (serde all-dialects, base `dialect.py` all-dialects) only after measured recall holds.
-4. First public GitHub submission once Docker-validated.
+1. Child coverage finished: pytest exit 0, 1621 passed, 676 s. `maps/coverage.child.json.gz` is 651 KB, 236 files. Pool jobs 2186 submitted / 2183 completed; the 3 missing jobs are all `tests/test_sqlglotc.py::TestSQLGlotC::test_build_removes_obsolete_extensions`. The shipping `coverage.json.gz` is unchanged. Scoring the current selector on the child map is **224.793 s, 0 misses** — slower than 206.161 s, because the new lines add tests on top of the routes. Do not swap the map until those route adds are dropped.
+2. Merge that map by pytest node ID, then drop blanket executor/optimizer route adds where the child line hit already covers the failure. Keep the serde/pool route where pickle happens outside the task wrapper.
+3. Docker-verify the candidate that still has zero sample misses. Do not claim a practice score or a sub-100 result until that run exists.
 
 ## For ChatGPT
 
-Please review Impact v2 fallbacks against REVIEW checklist, especially mixed unknown+known patches and fixture ownership. Propose the smallest safe narrowing experiments for `serde` and `dialects/dialect.py` (largest remaining cost drivers on sample).
+The route envelope is now in `selector.py` and `maps/impact.json` (`pool_routes`). `selected_files: set[str] = set()` is still the unique adapter needle. Whole-file class expansion is off. Control-flow function expansion runs only when the added and removed keyword sets differ. Unknown paths, unknown fixtures, unknown modules, and shared helpers are resolved before the comment-only shortcut. Child coverage is in progress; patched-tree probes were not started.

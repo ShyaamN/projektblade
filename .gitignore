@@ -14,3 +14,5 @@ maps/covpostings.bin
 maps/import_graph.json
 maps/coverage_collect.log
 maps/coverage_summary.json
+maps/coverage.child.json.gz
+maps/coverage.smoke.json.gz
