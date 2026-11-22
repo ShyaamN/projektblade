@@ -1,0 +1,116 @@
+# Independent review — 2026-11-21
+
+## URGENT: review of selector updated at 5:59 PM
+
+Cursor updated `selector.py`, `Dockerfile` and added `maps/impact.json` while this review was being written; the snapshot below is superseded. Fix these before trusting a benchmark:
+
+1. `is_comment_only_patch()` returns an empty selection for comments/blank lines, directly contradicting the explicit warning that comment-only changes are not promised harmless. Remove this shortcut; comments can affect SQL fixtures, directives, encodings and tooling.
+2. The `needs_broad_core` fallback is applied only if `selected` is empty. An unknown top-level path in a mixed patch, or a core path that has already selected some tests, therefore silently skips the promised full fallback. Set ALL immediately for every unknown/uncertain component and union across changes. Also unknown `sqlglot/` modules can currently return an empty set.
+3. Unknown SQL fixtures default to optimizer tests even if they belong elsewhere; test helper/conftest changes select only their own test file (possibly zero); deleted/renamed paths use only the new `diff --git` name. Handle both sides and fall back to ALL when ownership/import exposure is unresolved. Test a mixed known+unknown patch explicitly.
+4. Map test numbers are assumed to match runtime `/data/tests.json`; unknown numbers are silently discarded. Use IDs and verify index metadata against the supplied test list; otherwise fall back safely. Review `impact.json` provenance and generator for compliance and completeness. Static file rules and incomplete import maps do not establish recall, and syntax/import failures can affect whole importing files.
+5. `# Ensure nobody can read maps` is misleading: chmod actually makes them readable, which is necessary. No STATUS.md or benchmark for the new selector was available at inspection. Schedule implementation is promising but needs measured CPU and full sample/held-out miss checks.
+
+## Cursor handoff: implementation specification (latest)
+
+**Workspace snapshot:** STATUS.md and ARCHITECTURE.md absent; selector and Dockerfile remain starter. `maps/import_graph.json` has 184 file-to-module entries, 180 import lists and 154 reverse-import lists; it has no test-to-module edges and is not copied by the Dockerfile. `vendor/sqlglot` is pinned correctly. Do not mistake this graph for a complete dependency graph: inspect resolution of relative imports, package re-exports, conditional imports and dynamic dialect registration. Sample: 1,620 tests, 103.047 recorded seconds; 12/30 commits have zero failures, 13 have one, and five have multiple. Changed components include dialects, parsers, generators, optimizer, executor, expression classes and SQL fixtures; failure files cross component boundaries. `tests/test_optimizer.py` reads fixture pairs via a helper using computed filenames, so filename matching against test source alone is insufficient. Sample statistics are diagnostic, not a prior for hidden commits.
+
+### P0 — executable conservative selector and measurement
+
+**Tasks:** (1) extend base-only graph generation to include test files and fixture readers; persist versioned, deterministic map artifacts. (2) Implement path-aware diff parser and candidate union. (3) add per-k scheduling and per-commit debug records to stderr. (4) run sample and report selected counts, missed IDs, duration, CPU and candidate reasons. Establish branch/version and communicate progress in STATUS.md. Do not load `answers.json` in production.
+
+**Interface:** `/app/maps/index.json` (or compressed equivalent) includes schema version, pinned SHA, test IDs (not assumed stable across environments), file-to-symbol ranges, symbol-to-test IDs, module-to-test IDs, test-file-to-test IDs, fixture-to-test IDs, and `unknown/collection` sets. Validate unique IDs and translate to `/data/tests.json` numbers at startup; missing/mismatched IDs or incompatible metadata trigger full-suite fallback, not silent omission. Store base source or range metadata for patch mapping. Build map against the exact pinned source and locked environment; include generated maps in Docker image, readable by nobody. Runtime only reads `/data`, maps and source metadata, emits JSONL and logs to stderr. All paths normalize to repository-relative POSIX paths; reject traversal and ambiguous diff parsing.
+
+**Core algorithm (candidate tiers):**
+
+```
+for patch in sorted(patches):
+    changes = parse_unified_diff(patch)  # old/new paths, ranges, adds/deletes/renames
+    selected = empty_bitset()
+    for c in changes:
+        if parse_failed(c) or unknown_path(c) or environment_or_collection_change(c):
+            selected |= ALL; continue
+        if c touches test file:
+            selected |= all_tests_in_file(c)  # collection/import errors included
+            if shared_test_helper_or_conftest(c): selected |= affected_or_ALL
+        elif c touches known fixture:
+            selected |= fixture_readers[c.path] or ALL
+        elif c touches Python source:
+            selected |= collection_import_risk[c.module]
+            selected |= tests_reaching_changed_symbols(c.old_ranges, c.module)
+            selected |= callers_or_base_module_coverage_where_uncertain(c)
+            if structural_or_unresolved(c): selected |= conservative_module_or_ALL(c)
+        else: selected |= ALL
+    output(schedule(selected))
+```
+
+For source edits, AST-map deleted/replaced old lines to enclosing base functions and classes; insertion-only hunks anchor both neighboring old lines and enclosing scope; union all overlapping symbols including decorators. A change to class/module statements, imports, base classes, registration, public signatures, syntax or unknown scope widens to module coverage plus import/collection exposure; syntax/import failure can affect every test in files importing the module. If exact import exposure is unknown use full suite. Multi-file patches union all selections. Base coverage and graph evidence are incomplete: no safe claim that unseen paths or dynamic imports cannot fail. Do not return empty solely from a missing coverage hit, comments, filename, or AST ambiguity. Begin with full-suite on uncertainty and experiment with widening/narrowing separately; full-suite fallback is a safety policy, not a proof of correctness.
+
+**Critical tradeoff:** Unioning full transitive import closure for every ordinary function edit may select nearly everything, especially through `sqlglot` package imports. Use it for collection/import-risk changes and as an independently measured conservative reference; per-function execution maps may narrow ordinary body edits only after validation. Static graph must include test nodes and resolve re-exports; existing graph alone cannot select tests.
+
+### P1 — collect function and fixture coverage once
+
+**Hypothesis:** Runtime test-to-function and test-to-fixture maps from the pinned base yield a much smaller candidate set than file-level imports while retaining relevant executions. **Risk:** executing a changed function is neither necessary nor sufficient for a changed test outcome; new paths, import effects, timeouts, async work and fixture teardown can escape mapping.
+
+**Feasibility spike:** use a pytest plugin, tracing function calls with `sys.setprofile` or a compatible per-test coverage context, and intercept file reads (`open`/`io.open`) to map fixture paths. Track setup, call and teardown to the current pytest node ID; include collection/import activity separately, child/thread events if supported, and flag unsupported tracing rather than assume completeness. Persist `(normalized source path, qualname, firstlineno) -> node IDs`, module and fixture reader sets; enumerate AST ranges to map changed lines to code objects. Detect unmatched code objects and map to enclosing module. Pytest subtests remain under their parent node ID. Generate with `SKIP_INTEGRATION=0`, the starter lock and pinned checkout, matching collection IDs against supplied tests. Record unmapped tests, missing functions, collection errors, elapsed build time and artifact size. Confirm pytest setup, decorators, lambdas, generators, async and fixture activity experimentally; if tracer propagation or a coverage tool is unavailable, mark coverage incomplete and widen affected scopes. Time a representative subset first and extrapolate; if full generation cannot fit 10 minutes, generate once outside the image and commit plain maps under 20 MB, while Docker builds verify the map metadata. Build time is uncharged but limit still applies.
+
+**Acceptance:** independently validate map on held-out test executions and match all 1,620 IDs or explicitly record exceptions; compare static-only, function-only and conservative hybrid on sample and independent mutations. No additional misses against the reference and positive total-score improvement are needed before adopting narrowing. Track miss by whole commit, not number of missed tests. Sample labels are evaluation only, never a runtime lookup or training table for edit kinds.
+
+### P2 — scheduling and CPU
+
+For selected durations in integer milliseconds, sort descending once; for k=1..8 assign each to the least-loaded of k bins (deterministic ties), discard empty bins and minimize `max(load)+2000*nonempty_bins`. Reuse the best precomputed full-suite schedule for fallback. Precompute test ordering, bitset unions and compact output; measure map load and all process CPU. Compare to fixed three workers with identical selections. A scheduling gain is accepted only if total simulated reduction exceeds added measured CPU across the batch. Validate output under 2 MB and all specified Docker restrictions.
+
+### Evaluation gates and target
+
+Report per commit: selected count, worker cost, makespan, selected seconds, miss flag and missed IDs locally, path categories, fallback reason; report aggregate simulated, CPU, wall, memory, stdout bytes and score median on repeated container runs. Compare candidates on held-out files/change families and independent adversarial cases (new path, import error, module initialization, decorators, shared inheritance, fixture renames, deletion-only, mixed patch). Practice board reports aggregate misses only; never infer their identities. Each additional miss costs 300 seconds: a 10-second simulated saving needs over 3.33 percentage points absolute reduction in miss probability to justify spending 10 seconds for safety, or conversely a 10-second saving is negated by a >3.33 point increase in miss probability. Account for batch CPU separately. Below 103.5 is a goal, not a forecast: 30 nonempty commits already incur at least 60 seconds worker overhead; zero-selection decisions can help but require strong evidence and cannot be based on comment-only changes. Final workload is larger and unseen, so practice and final totals are not directly comparable.
+
+## Access and baseline
+
+Correction: the user confirmed this workspace is the actual project. The root `selector.py` and Dockerfile currently match the starter; `vendor/sqlglot` is at the required pinned commit, and `maps/import_graph.json` contains a 184-file module map and import relationships, but no map-generation source or selector consuming that map was found. No STATUS.md or ARCHITECTURE.md is present. The existing `output.jsonl` scores 1210.470 simulated seconds with zero misses on the 30 sample commits using `python score.py sample sample/answers.json output.jsonl`; CPU is unmeasured. This is a score of the saved output, not a verified Docker run or evidence of an optimized selector. Please have Cursor supply its current status, map-generation source and measured Docker CPU/benchmark results when available.
+
+## Scoring and priorities
+
+For each commit, cost is max worker load + 2 seconds per nonempty worker + 300 seconds if any failing test is omitted. Total also includes all container process user and system CPU time; the median of three total scores is rounded to 0.1 seconds. Builds are uncharged. Empty selection costs zero. The failure penalty is once per commit, not per omitted test. Under the final rules the top entries are rerun five times; scores within one second of the best form an earliest-submission tie group. Local `make sample` omits CPU and cannot establish final performance.
+
+The largest unverified risk is false confidence in selection recall on unseen changes: a single miss costs 300 seconds, nearly three times the cited 103.5-second practice leader's whole batch score. Prioritize a measured, generalizable safety envelope before small scheduling improvements.
+
+For two policies A and B, compare paired commit costs: B is preferable in expectation when its increased selection cost plus CPU cost is smaller than 300 times the reduction in probability of a miss. The relevant event is *any* omitted failing test, not an independent per-test estimate. If a commit is already certainly missed, adding only some omitted failures gives no penalty benefit; conditional and correlated failure sets matter. These probabilities are unknown and must be estimated, not assumed.
+
+## Experiment 1 — Coverage plus conservative dependency envelope
+
+**Hypothesis:** Pinned-base per-test coverage and an import/dependency graph can shrink selections while conservative fallbacks catch changes that coverage alone misses.
+
+**Implementation:** At build time collect per-test line coverage and import-time/collection coverage in the pinned environment; preserve pytest test IDs, subtests, fixture and test-file relationships, integration settings, and dynamic imports. Reverse-index source lines and modules to tests. Parse both old and new diff ranges, including deletions, additions at boundaries, renames, syntax errors and missing paths. Union coverage with static reverse dependencies and fixture/import-time affected tests. Fall back to a broader module, subsystem or entire suite when mapping is uncertain, especially for shared parser, optimizer, generator, dialect registration, package initialization, test infrastructure and data files. New execution paths, reflection and transitive effects prevent coverage from being a sound proof; never infer that a comment-only patch is harmless. Measure index size, build time, startup CPU and memory.
+
+**Benefit / risk:** Potentially the largest selection-cost reduction while controlling misses; map gaps and globally shared behavior remain serious risks. Build collection may not match labeling or fit the 10-minute build budget.
+
+**Procedure:** Compare static-only, coverage-only, union and union with fallbacks using identical scheduling and paired per-commit outputs. Check every known failing test against the output; log misses and reasons, selected count, simulated cost, CPU, memory and output bytes. Generate held-out mutation families from the pinned tree without using answer lookup: shared modules, decorators, fixtures, dynamic import, syntax/import errors, deletions and new paths. Evaluate by held-out files/change families, not random mutations of the same site. Verify the contest rules permit the generation method before using any derived map; maps from the base are explicitly permitted, answer lookup by patch or edit kind is forbidden.
+
+**Acceptance:** No regression in known failing-test recall on sample and independently held-out cases; all fallbacks exercised; paired full-score improvement including measured CPU, with no build/format limit violations. This is evidence, not a guarantee of unseen recall.
+
+## Experiment 2 — Symbol-aware selection and risk calibration
+
+**Hypothesis:** Within a safe dependency envelope, mapping changed definitions and symbol uses to tests can reduce broad module selections. Conversely, changes to shared dispatch, registration, inheritance, module initialization or unknown constructs warrant widening.
+
+**Implementation:** Use AST and base-source ranges to resolve enclosing definitions on both sides of a diff; connect symbols through calls, imports, inheritance and relevant coverage. Handle aliases, methods, decorators, class attributes, module-level execution and test/fixture changes conservatively. Do not delete candidate tests solely because an approximate call graph lacks an edge. If estimating risk, use observable features rather than lookup tables from patches or edit kinds to answers; verify compliance with organizers if the planned model could amount to a prohibited answer table. A probability estimate is useful only if calibrated on independent data, particularly at the whole-commit miss level.
+
+**Benefit / risk:** Can reduce costly tests concentrated in large files; Python dispatch, monkeypatching and generated code make aggressive symbol filtering hazardous.
+
+**Procedure:** Ablate symbol filtering against experiment 1, reporting per-commit marginal test time, all omitted failures and miss rate by held-out file and change family. Use grouped train/validation splits, leave whole modules and mutation operators out, and report uncertainty; retain untouched cases for final comparison. Stress unseen changes that introduce new paths, override methods or change import behavior. Compute paired total score including CPU, not just average test count.
+
+**Acceptance:** Adopt only rules with an independently observed score improvement and no new held-out miss, with explicit conservative fallback for unresolved symbols. Zero misses in a small sample is weak evidence: with 30 independent representative cases, a rough 95% upper bound on miss probability is about 9.5%; real cases may be correlated or unrepresentative.
+
+## Experiment 3 — Cost-aware scheduling and CPU budget
+
+**Hypothesis:** Choosing the worker count per selected set and balancing recorded durations reduces simulated cost; precomputation and compact indexes keep runtime CPU from erasing those savings.
+
+**Implementation:** For k=1..8, run longest-processing-time-first partitioning, score each using integer milliseconds and 2,000 ms per nonempty worker, and choose the least-cost partition. Try bounded local swaps or exact search only on small expensive cases if their *batch CPU cost* is justified; use lower bound max(longest test, ceil(total/k)) + 2k to quantify remaining room. Cache immutable maps and repeated selection sets; avoid subprocess-per-commit and repeated parsing. The CPU term includes every process, so parallelism does not make CPU free. Verify 2 MB output, memory, read-only filesystem and `nobody` behavior.
+
+**Benefit / risk:** Guaranteed no worse than the best evaluated schedule for the same test set; a heuristic is not generally an optimal partition. More scheduling computation may cost more CPU than it saves.
+
+**Procedure:** Hold selection fixed; compare fixed 1/3/8 workers, per-k LPT and bounded improvement. Record per-commit makespan, worker overhead, lower-bound gap, total simulated savings, actual Docker CPU user+system, wall time, RSS and stdout bytes over repeated runs. Include CPU consumed by all subprocesses.
+
+**Acceptance:** Actual total score improves on sample and independent workloads, no selection changes or misses, and resource/output limits retain headroom. Prefer the simpler method when the improvement is within timing noise.
+
+## Compliance
+
+No precomputed patch-to-answer or edit-kind-to-answer lookup. Base-commit coverage/import/fixture maps are explicitly allowed. The project must be original team work, MIT licensed, and disclose brought-in code/libraries in its README; do not copy other teams' entries. Build downloads must follow the track's allowlist. The final uses unseen changes and may select the best practice submission by default, so explicitly choose the strongest robust candidate before the November 22, 8:00 AM Pacific cutoff.

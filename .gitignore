@@ -1,0 +1,16 @@
+output.jsonl
+output.local.jsonl
+output.stderr
+__pycache__/
+*.pyc
+.pytest_cache/
+vendor/sqlglot/
+downloads/
+starter/
+*.tar.gz
+.DS_Store
+maps/covmeta.json
+maps/covpostings.bin
+maps/import_graph.json
+maps/coverage_collect.log
+maps/coverage_summary.json
