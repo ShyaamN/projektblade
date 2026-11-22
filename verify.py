@@ -196,6 +196,10 @@ def _run_child(pytest, root, files, node_ids):
     builtins.open = overlay.redirect(builtins.open)
     io.open = overlay.redirect(io.open)
     sys.addaudithook(overlay.audit)
+    if node_ids is None:
+        for name in sorted(overlay.modules):
+            importlib.import_module(name)
+        return int(not overlay.invalid and overlay.seen == files.keys())
     verdicts = _Verdicts(pytest, node_ids)
     status = pytest.main(
         ["-q", "--tb=no", "-p", "no:cacheprovider", *node_ids], plugins=[verdicts]
@@ -211,6 +215,16 @@ class Verifier:
         self.cpu_left = _TOTAL_PROBE_CPU
         self.deadline = time.monotonic() + _TOTAL_PROBE_WALL
         self.pytest = None
+
+    def import_ok(self, patch):
+        """Return True on a clean import, False on error, None for unsupported diffs."""
+        try:
+            files = _overlays(self.root, patch)
+            if not files or any(not path.endswith(".py") for path in files):
+                return None
+            return bool(self._probe(files, None, 0.75, 2.0))
+        except (ImportError, OSError, UnicodeError, ValueError):
+            return None
 
     def passes(self, patch: str, node_ids: list[str], potential_seconds: float) -> set[str]:
         """Each returned ID has a complete, explicit pass on this exact patch."""

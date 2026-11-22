@@ -641,6 +641,9 @@ class Index:
     function_scopes: dict | None = None
     inherited_dialect_tests: dict | None = None
     redundant_import_sites: dict | None = None
+    isolated_lines: dict | None = None
+    fixture_reads: dict | None = None
+    isolated_untraced: tuple = ()
 
     @classmethod
     def load(cls, path: Path, ids: dict[str, int], sha: str) -> Index | None:
@@ -649,7 +652,7 @@ class Index:
                 data = marshal.loads(stream.read(), allow_code=False)
             if data["schema"] != 3 or data["pinned_sha"] != sha or data["test_ids"] != list(ids):
                 return None
-            return cls(data["sources"], data["lines"], set(map(ids.__getitem__, data["preserve"])),
+            result = cls(data["sources"], data["lines"], set(map(ids.__getitem__, data["preserve"])),
                        data.get("tokenizer"), data.get("primary"), data.get("operator_lines"),
                        data.get("test_sources"), data.get("import_test_files"),
                        data.get("multiline_literals"), data.get("expression_flag_sites"),
@@ -657,14 +660,38 @@ class Index:
                        data.get("filtered_sql_fixtures"), set(data.get("parser_comment_free", ())),
                        data.get("direct_fixture_readers"), data.get("function_scopes"),
                        data.get("inherited_dialect_tests"), data.get("redundant_import_sites"))
+            extra = path.with_name("isolated.gz")
+            if extra.is_file():
+                with gzip.open(extra, "rb") as stream:
+                    pin, inventory, lines, fixtures, partial = marshal.loads(stream.read(), allow_code=False)
+                if pin == sha and inventory == list(ids):
+                    result.isolated_lines = lines
+                    result.fixture_reads = fixtures
+                    result.isolated_untraced = tuple(partial)
+            return result
         except (OSError, EOFError, ValueError, KeyError, TypeError):
             return None
 
     def _hits(self, path: str, line: int) -> set[int]:
         posting = self.lines[path].get(str(line))
-        if posting is None:
-            return set()
-        return {n for n, in struct.iter_unpack("<H", base64.b64decode(posting))}
+        hits = self.isolated_hits(path, (line,))
+        if posting is not None:
+            hits.update(n for n, in struct.iter_unpack("<H", base64.b64decode(posting)))
+        return hits
+
+    @staticmethod
+    def numbers(mask):
+        while mask:
+            bit = mask & -mask
+            yield bit.bit_length() - 1
+            mask ^= bit
+
+    def isolated_hits(self, path, lines):
+        observations = (self.isolated_lines or {}).get(path, {})
+        mask = 0
+        for line in lines:
+            mask |= observations.get(line, 0)
+        return set(self.numbers(mask))
 
     def comment_free_tests(self, validated: dict[str, str]) -> set[int]:
         path = "sqlglot/parser.py"
@@ -757,5 +784,10 @@ class Index:
         if scopes:
             bodies = changed_function_bodies(source, output)
             if bodies and all(line in scopes for line in bodies):
-                return {test for line in bodies for test in scopes[line]}
+                hits = {test for line in bodies for test in scopes[line]}
+                if self.isolated_lines:
+                    for node in ast.walk(_ast(source)):
+                        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.lineno in bodies:
+                            hits.update(self.isolated_hits(path, range(node.body[0].lineno, node.end_lineno + 1)))
+                return hits
         return None

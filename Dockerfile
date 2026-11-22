@@ -11,6 +11,7 @@ RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests
 
 # Permitted static maps from pinned sqlglot (no patch→answer tables).
 COPY maps/impact.json /app/maps/impact.json
+COPY maps/isolated.gz /app/maps/isolated.gz
 COPY maps/coverage.json.gz /app/maps/coverage.json.gz
 COPY maps/pinpoint.marshal.gz /app/maps/pinpoint.marshal.gz
 COPY selector.py pinpoint.py verify.py /app/

@@ -441,6 +441,21 @@ def select(
         # Reconstruct and compile before any empty or narrowed selection.
         reason = python_risk(patch, changes, pinpoint, validated, import_changes, test_changes)
         if reason:
+            # A broken private module only breaks tests that import or execute it.
+            # Test collection, ordinary execution and spawned workers contribute
+            # to the exposure map. Unknown and widely shared modules stay broad.
+            path = changes[0].old_path
+            if (single_file and reason in {"python_syntax", "python_package_init"}
+                    and path and path.startswith("sqlglot/") and pinpoint.isolated_lines
+                    and path in (pinpoint.import_test_files or {})):
+                affected = set()
+                for test_file in pinpoint.import_test_files[path]:
+                    affected.update(file_to_numbers.get(test_file, ()))
+                result.numbers = affected | pinpoint.isolated_hits(path, pinpoint.isolated_lines.get(path, {}))
+                result.numbers.update(pinpoint.isolated_untraced)
+                if result.numbers and len(result.numbers) * 100 < len(all_numbers) * 95:
+                    result.reasons.append(f"{reason}_exposure:{path}")
+                    return result
             result.force_all = True
             result.reasons.append(reason)
             result.numbers = set(all_numbers)
@@ -469,6 +484,25 @@ def select(
             if not changes:
                 return result
 
+    if pinpoint is not None:
+        # Drop an inert Python sibling before routing the remaining files.
+        # Reconstruct first: a line beginning with '#' can be SQL in a string.
+        remaining = []
+        for change in changes:
+            path = change.old_path
+            if path in validated and path in pinpoint.sources and is_nonexecutable_edit(change):
+                try:
+                    before = ast.parse(pinpoint.sources[path], type_comments=True)
+                    after = ast.parse(validated[path], type_comments=True)
+                except SyntaxError:
+                    remaining.append(change)
+                    continue
+                if ast.dump(before) == ast.dump(after):
+                    continue
+            remaining.append(change)
+        changes = remaining
+        if not changes:
+            return result
     identity = [change for change in changes if _none_identity_edit(change)] if single_file else []
     if identity:
         result.reasons.append(f"none_identity:{len(identity)}")
@@ -480,7 +514,7 @@ def select(
         broad = []
         allow_equivalence = single_file
         for change in changes:
-            if change.old_path == "sqlglot/serde.py" or (
+            if (change.old_path == "sqlglot/serde.py" and not pinpoint.isolated_lines) or (
                 change.old_path == change.new_path
                 and change.old_path
                 and not change.old_path.startswith(("sqlglot/optimizer/", "sqlglot/typing/"))
@@ -519,6 +553,15 @@ def select(
     direct_fixtures = (pinpoint.direct_fixture_readers or {}) if pinpoint is not None else {}
     for change in changes:
         path = change.old_path
+        if path == change.new_path and path in (pinpoint.fixture_reads if pinpoint and pinpoint.fixture_reads else {}):
+            if not pinpoint.fixture_equivalent(patch, change):
+                result.numbers.update(pinpoint.numbers(pinpoint.fixture_reads[path]))
+                result.reasons.append(f"isolated_fixture_read:{path}")
+                if path.endswith(".sql"):
+                    # Child-process work and isolated test setup are complementary.
+                    rel = path.removeprefix("tests/fixtures/")
+                    result.numbers.update(cov.fixtures.get(rel, ()))
+            continue
         if path == change.new_path and path in direct_fixtures:
             result.numbers.update(direct_fixtures[path])
             result.reasons.append(f"direct_fixture:{path}")
@@ -1118,7 +1161,7 @@ def main() -> None:
     commits = sorted((DATA / "commits").glob("*.patch"))
     verifier = None
     sqlglot_root = Path("/opt/sqlglot")
-    if os.environ.get("BLADE_VERIFY") != "0" and sys.platform == "linux" and sqlglot_root.is_dir():
+    if sys.platform == "linux" and sqlglot_root.is_dir():
         from verify import Verifier
 
         verifier = Verifier(sqlglot_root)
@@ -1131,6 +1174,30 @@ def main() -> None:
             selection = select(
                 patch, cov, impact, id_to_number, all_numbers, file_to_numbers, pinpoint=pinpoint
             )
+            if verifier and pinpoint and not selection.force_all:
+                changes = parse_unified_diff(patch) or []
+                eager = any(
+                    c.old_path in pinpoint.sources and c.new_path == c.old_path
+                    and not is_nonexecutable_edit(c)
+                    and any(not _in_function(impact, c.old_path, n)
+                            for n in (c.old_lines or c.context_lines))
+                    for c in changes
+                )
+                if eager and verifier.import_ok(patch) is False:
+                    for c in changes:
+                        if c.old_path not in pinpoint.sources:
+                            continue
+                        files = (pinpoint.import_test_files or {}).get(c.old_path)
+                        if not files:
+                            selection.force_all = True
+                            break
+                        for file in files:
+                            selection.numbers.update(file_to_numbers.get(file, ()))
+                        traced = (pinpoint.isolated_lines or {}).get(c.old_path, {})
+                        selection.numbers.update(pinpoint.isolated_hits(c.old_path, traced))
+                    selection.excluded.clear()
+                    selection.numbers.update(pinpoint.isolated_untraced)
+                    selection.reasons.append("patched_import_failed")
         if selection.force_all:
             workers = full_schedule
             n = len(tests)
@@ -1139,6 +1206,7 @@ def main() -> None:
             selection.slack_candidates.difference_update(selection.excluded)
             if (
                 verifier is not None
+                and os.environ.get("BLADE_VERIFY") == "1"
                 and _verification_eligible(selection.numbers, by_number)
             ):
                 ordered = [by_number[number] for number in sorted(selection.numbers)]

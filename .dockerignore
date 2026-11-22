@@ -7,5 +7,6 @@
 !maps/
 maps/*
 !maps/impact.json
+!maps/isolated.gz
 !maps/coverage.json.gz
 !maps/pinpoint.marshal.gz
