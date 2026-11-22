@@ -201,6 +201,20 @@ def isolated_test_methods(base, nodes):
             for path, names in methods.items()}
 
 
+def merge_stress_lines(maps, coverage):
+    stress = json.loads((maps / "stress-lines.json").read_text(encoding="utf-8"))
+    ids = {node: i for i, node in enumerate(coverage["test_ids"])}
+    expected = {node for node in ids if "test_max_nodes" in node}
+    if stress["pinned_sha"] != PINNED or set(stress["nodes"]) != expected:
+        raise RuntimeError("Stress trace inventory mismatch")
+    for node, files in stress["nodes"].items():
+        for path, lines in files.items():
+            postings = coverage["files"].setdefault(path, {})
+            for line in lines:
+                key = str(line)
+                postings[key] = sorted({*postings.get(key, ()), ids[node]})
+
+
 def main():
     base = ROOT / "vendor/sqlglot"
     head = subprocess.check_output(["git", "-C", str(base), "rev-parse", "HEAD"], text=True).strip()
@@ -222,15 +236,14 @@ def main():
         or coverage["child_jobs"] != summary["child_jobs"]
     ):
         raise RuntimeError("Child coverage is incomplete or misattributed")
-    # Scope this optimization to loaded modules. Env, packaging, native-source
-    # and tests remain in the ordinary selection path.
+    merge_stress_lines(maps, coverage)
+    # Trace availability and source availability are independent. A valid edit
+    # to a pinned but untraced module still needs syntax validation and routing.
     sources = {
-        p: (base / p).read_text(encoding="utf-8")
-        for p in coverage["files"]
-        if p.startswith("sqlglot/") and (base / p).is_file()
+        path.relative_to(base).as_posix(): path.read_text(encoding="utf-8")
+        for path in sorted((base / "sqlglot").rglob("*.py"))
     }
     preserve = set(summary["nodes_short"])
-    preserve.update(test for test in coverage["test_ids"] if "test_max_nodes" in test)
     lines = {}
     operator_lines = {}
     multiline_literals = {}
@@ -241,9 +254,14 @@ def main():
             for node in ast.walk(tree)
             if isinstance(node, (ast.If, ast.Assign))
         }
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.If, ast.While, ast.For, ast.Assign, ast.AugAssign, ast.Return, ast.Expr)):
+                entry = getattr(node, "test", None) or getattr(node, "iter", None) or getattr(node, "value", None)
+                if entry is not None:
+                    keep.update((str(node.lineno), str(entry.lineno)))
         lines[path] = {
             line: base64.b64encode(struct.pack(f"<{len(hits)}H", *hits)).decode()
-            for line, hits in coverage["files"][path].items() if line in keep
+            for line, hits in coverage["files"].get(path, {}).items() if line in keep
         }
         checked = sorted({
             node.lineno for node in ast.walk(tree)
@@ -265,6 +283,7 @@ def main():
         primary = json.load(stream)
     if primary["pinned_sha"] != PINNED or primary["test_ids"] != coverage["test_ids"]:
         raise RuntimeError("Parent coverage inventory mismatch")
+    merge_stress_lines(maps, primary)
     primary["files"] = {
         path: zlib.compress(
             marshal.dumps({int(line): hits for line, hits in bucket.items()}, 4, allow_code=False),

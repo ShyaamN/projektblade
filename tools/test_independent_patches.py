@@ -51,6 +51,14 @@ CASES = (
     ("filtered_fixture_trivia", "tests/fixtures/optimizer/annotate_types.sql",
      "# dialect: spark", "-- project note, filtered by the fixture reader\n# dialect: spark",
      "tests/test_optimizer.py::TestOptimizer::test_annotate_types", None),
+    ("parser_small_node_limit", "sqlglot/parser.py",
+     "if self.max_nodes > -1:", "if self.max_nodes > 3:",
+     "tests/dialects/test_athena.py::TestAthena::test_max_nodes", "ParseError not raised"),
+    ("invalid_source_encoding", "sqlglot/expressions/core.py",
+     '"""sqlglot expressions core - base classes, traits, operators, and helpers."""',
+     '# coding: projektblade_unavailable_codec\n'
+     '"""sqlglot expressions core - base classes, traits, operators, and helpers."""',
+     "tests/test_parser.py::TestParser::test_union", "unknown encoding"),
 )
 
 
@@ -76,7 +84,9 @@ def check_pytest(root, node):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", default="e525db5321a7acbe93c0994981f1047e929ba35f")
+    parser.add_argument("--case", action="append", choices=[c[0] for c in CASES])
     args = parser.parse_args()
+    cases = [case for case in CASES if not args.case or case[0] in args.case]
     test_path = ROOT / "sample/tests.json"
     tests = json.loads(test_path.read_text(encoding="utf-8"))["tests"]
     by_id = {test["id"]: test["number"] for test in tests}
@@ -100,7 +110,7 @@ def main():
         for relative in ("sqlglot", "tests"):
             shutil.copytree(UPSTREAM / relative, checkout / relative,
                             ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache"))
-        for key, relative, old, new, _, _ in CASES:
+        for key, relative, old, new, _, _ in cases:
             original = (checkout / relative).read_text(encoding="utf-8")
             assert original.count(old) >= 1, key
             updated = original.replace(old, new, 1)
@@ -108,7 +118,7 @@ def main():
             (data / "commits" / f"{key}.patch").write_text(patch, encoding="utf-8")
         before = selection(baseline, data)
         after = selection(ROOT, data)
-        for key, relative, old, new, node, expected in CASES:
+        for key, relative, old, new, node, expected in cases:
             target = checkout / relative
             original = target.read_bytes()
             clean = check_pytest(checkout, node)

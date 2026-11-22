@@ -6,7 +6,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pinpoint import Index, _predicate_entry, classify_line
+from pinpoint import Index, _predicate_entry, classify_line, local_effect_lines
 from selector import parse_unified_diff
 
 
@@ -48,6 +48,13 @@ def check():
     patch = make_patch(path, original, edited)
     change, = parse_unified_diff(patch)
     assert Index({path: original}, {}, set(), None).narrow(patch, change) is None
+
+    original = "def f(x):\n    result = (\n        x + 1\n    )\n    return result\n"
+    edited = original.replace("x + 1", "x + 3\n        + 4").replace("return result", "return result * 2")
+    assert local_effect_lines(original, edited) == [{2, 3}, {5}]
+    assert local_effect_lines(original, edited.replace("return result * 2", "return (y := result)")) is None
+    assert local_effect_lines(original, edited.replace("def f(x):", "def f(x=1):")) is None
+    assert local_effect_lines(original, edited.replace("result = (", "self.result = (")) is None
 
 
 if __name__ == "__main__":

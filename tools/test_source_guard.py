@@ -81,6 +81,13 @@ def main() -> int:
     selected_core = choose(import_patch, loaded)
     assert affected_parser_test in selected_core.numbers, selected_core.reasons
 
+    untraced = "sqlglot/expressions/string.py"
+    untraced_source = pinpoint.sources[untraced]
+    benign = patch_for(untraced, untraced_source, "# A descriptive module comment\n" + untraced_source)
+    assert not choose(benign, loaded).force_all
+    invalid = patch_for(untraced, untraced_source, "def missing_body\n" + untraced_source)
+    assert choose(invalid, loaded).force_all
+
     quoted = 'diff --git "a/sqlglot/a b.py" "b/sqlglot/a b.py"\n'
     assert choose(import_patch + quoted, loaded).force_all
 

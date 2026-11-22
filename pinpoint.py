@@ -5,11 +5,13 @@ from __future__ import annotations
 import ast
 import base64
 import gzip
+from io import BytesIO
 import marshal
 from dataclasses import dataclass
 from pathlib import Path
 import re
 import struct
+import tokenize
 import zlib
 
 
@@ -193,7 +195,12 @@ def python_risk(
                 and _same_operator(old, change.removed_bodies[0], change.added_bodies[0])
             )
             if not same_operator:
-                compile(output, old, "exec", dont_inherit=True)
+                binary = output.encode("utf-8")
+                if "coding" in "\n".join(output.split("\n", 2)[:2]):
+                    encoding = tokenize.detect_encoding(BytesIO(binary).readline)[0]
+                    if encoding != "utf-8":
+                        return "python_encoding_changed"
+                compile(binary, old, "exec", dont_inherit=True)
             if old.startswith("tests/"):
                 body_changes = _test_body_changes(original, output)
                 if body_changes is None:
@@ -289,6 +296,51 @@ def _guard_bindings(node: ast.expr) -> tuple | None:
     ):
         return None
     return tuple(sorted(bindings))
+
+
+_RUNTIME_FIELDS = {
+    ast.Assign: "value", ast.AugAssign: "value", ast.Return: "value",
+    ast.Expr: "value", ast.If: "test", ast.While: "test", ast.For: "iter",
+}
+
+
+def local_effect_lines(original: str, updated: str) -> list[set[int]] | None:
+    """Find evaluation sites when only existing function expressions change."""
+    sites: list[set[int]] = []
+
+    def compare(old, new, in_function=False):
+        if type(old) is not type(new):
+            return False
+        if isinstance(old, list):
+            return len(old) == len(new) and all(compare(a, b, in_function) for a, b in zip(old, new))
+        if not isinstance(old, ast.AST):
+            return old == new
+        runtime_field = _RUNTIME_FIELDS.get(type(old)) if in_function else None
+        if isinstance(old, (ast.Assign, ast.AugAssign, ast.Expr)):
+            # Keep declarations, descriptors, docstrings and global writes in the wider path.
+            if isinstance(old, ast.Assign) and any(not isinstance(t, ast.Name) for t in old.targets):
+                runtime_field = None
+            if isinstance(old, ast.AugAssign) and not isinstance(old.target, ast.Name):
+                runtime_field = None
+            if isinstance(old, ast.Expr) and not isinstance(old.value, ast.Call):
+                runtime_field = None
+        for name in old._fields:
+            left, right = getattr(old, name, None), getattr(new, name, None)
+            if name == runtime_field and not _same(left, right):
+                if not all(isinstance(v, ast.expr) and _safe_expression(v) for v in (left, right)):
+                    return False
+                if isinstance(old, ast.Expr) and not isinstance(right, ast.Call):
+                    return False
+                sites.append({old.lineno, left.lineno})
+                continue
+            nested_function = isinstance(old, (ast.FunctionDef, ast.AsyncFunctionDef))
+            nested_scope = nested_function or isinstance(old, ast.ClassDef)
+            inside = name == "body" and nested_function if nested_scope else in_function
+            if not compare(left, right, inside):
+                return False
+        return True
+
+    return sites if compare(_ast(original), _ast(updated)) and sites else None
 
 
 def classify_line(path: str, original: str, line: int, replacement: str) -> str | None:
@@ -524,4 +576,11 @@ class Index:
                 return self._hits(path, entry)
             if classify_line(path, source, line, change.added_bodies[0]) == "exact":
                 return self._hits(path, line)
+        if not change.structural and path in self.lines:
+            sites = local_effect_lines(source, output)
+            if sites:
+                observations = [set().union(*(self._hits(path, line) for line in site)) for site in sites]
+                # An unobserved evaluation site stays in the broader fallback.
+                if all(observations):
+                    return set().union(*observations)
         return None
