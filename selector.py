@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from pinpoint import Index as PinpointIndex
+from pinpoint import python_risk
 
 DATA = Path("/data")
 APP_DIR = Path(__file__).resolve().parent
@@ -385,6 +386,15 @@ def select(
         result.reasons.append("diff_parse_failed")
         result.numbers = set(all_numbers)
         return result
+
+    if pinpoint is not None:
+        # Reconstruct and compile before any empty or narrowed selection.
+        reason = python_risk(patch, changes, pinpoint.sources)
+        if reason:
+            result.force_all = True
+            result.reasons.append(reason)
+            result.numbers = set(all_numbers)
+            return result
 
     identity = [change for change in changes if _none_identity_edit(change)]
     if identity:

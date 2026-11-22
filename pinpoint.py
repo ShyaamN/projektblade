@@ -80,6 +80,30 @@ def _patched_source(path: str, source: str, patch: str) -> str | None:
     return "\n".join([*output, *lines[cursor:]]) + "\n"
 
 
+def python_risk(patch: str, changes, sources: dict) -> str | None:
+    """Full-suite reason when a Python edit cannot be reconstructed and compiled.
+
+    ``compile`` does not execute the file. A rename, deletion, mismatched hunk,
+    or syntax error can fail import or collection for every exposed test.
+    """
+    for change in changes:
+        old, new = change.old_path, change.new_path
+        if not any(path and path.endswith(".py") for path in (old, new)):
+            continue
+        if old != new:
+            return "python_path_changed"
+        if old not in sources:
+            return "python_source_missing"
+        output = _patched_source(old, sources[old], patch)
+        if output is None:
+            return "python_context"
+        try:
+            compile(output, old, "exec")
+        except (SyntaxError, ValueError):
+            return "python_syntax"
+    return None
+
+
 def _ast(source: str) -> ast.Module:
     return ast.parse(source, type_comments=True)
 
