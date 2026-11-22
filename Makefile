@@ -1,4 +1,4 @@
-IMAGE ?= blast-radius-entry
+IMAGE ?= projektblade
 SAMPLE := $(CURDIR)/sample
 OUTPUT := $(CURDIR)/output.jsonl
 

@@ -7,6 +7,7 @@ import-time dialect attributes, and serde callers that base coverage misses.
 
 from __future__ import annotations
 
+import ast
 import gzip
 import json
 import math
@@ -136,6 +137,40 @@ def parse_unified_diff(patch: str) -> list[FileChange] | None:
     return changes
 
 
+def unresolved_path(
+    path: str,
+    cov: CoverageIndex,
+    impact: ImpactMaps,
+    file_to_numbers: dict[str, list[int]],
+) -> str | None:
+    """Reason to run the full suite, or None when this path is a known input."""
+    if path in SHARED_TEST_HELPERS or path.endswith("/conftest.py"):
+        return f"shared_test_infra:{path}"
+    if path.startswith("tests/fixtures/") and path.endswith(".sql"):
+        rel = path[len("tests/fixtures/") :]
+        stem = rel[: -len(".sql")]
+        base = Path(stem).name
+        known = (
+            cov.fixtures.get(rel)
+            or cov.fixtures.get(stem)
+            or cov.fixtures.get(base)
+            or impact.fixture_to_ids.get(stem)
+            or impact.fixture_to_ids.get(base)
+        )
+        if not known:
+            return f"unknown_fixture:{path}"
+        return None
+    if path.startswith("tests/") and path.endswith(".py"):
+        if path not in file_to_numbers:
+            return f"unknown_test_file:{path}"
+        return None
+    if not path.startswith("sqlglot/"):
+        return f"unknown_path:{path}"
+    if path.endswith(".py") and impact.path_to_module.get(path) is None:
+        return f"unknown_sqlglot_module:{path}"
+    return None
+
+
 def is_nonexecutable_edit(change: FileChange) -> bool:
     """True when every +/- body is blank or # comment (coverage-empty safe skip)."""
     bodies = change.added_bodies + change.removed_bodies
@@ -255,11 +290,12 @@ class ImpactMaps:
     module_to_test_files: dict[str, list[str]]
     function_ranges: dict[str, list[dict]]
     serde_test_files: list[str]
+    pool_routes: dict
 
     @classmethod
     def load(cls, runtime_ids: set[str]) -> ImpactMaps:
         if not IMPACT_PATH.exists():
-            return cls(False, "missing impact", {}, {}, set(), {}, {}, {}, [])
+            return cls(False, "missing impact", {}, {}, set(), {}, {}, {}, [], {})
         raw = json.loads(IMPACT_PATH.read_text(encoding="utf-8"))
         test_ids = set(raw.get("test_ids", []))
         map_ok, map_error = True, ""
@@ -280,6 +316,7 @@ class ImpactMaps:
             module_to_test_files=raw.get("module_to_test_files", {}),
             function_ranges=raw.get("function_ranges", {}),
             serde_test_files=list(raw.get("serde_test_files", [])),
+            pool_routes=raw.get("pool_routes") or {},
         )
 
 
@@ -335,6 +372,13 @@ def select(
         result.numbers = set(all_numbers)
         return result
 
+    identity = [change for change in changes if _none_identity_edit(change)]
+    if identity:
+        result.reasons.append(f"none_identity:{len(identity)}")
+        if len(identity) == len(changes):
+            return result
+        changes = [change for change in changes if change not in identity]
+
     selected_files: set[str] = set()
 
     def add_files(files: set[str], reason: str) -> None:
@@ -349,6 +393,17 @@ def select(
         if not paths:
             result.force_all = True
             result.reasons.append("empty_paths")
+            break
+
+        # Unknown paths and fixtures force the full suite before a comment-only
+        # hunk is allowed to skip line coverage.
+        for path in sorted(paths):
+            reason = unresolved_path(path, cov, impact, file_to_numbers)
+            if reason:
+                result.force_all = True
+                result.reasons.append(reason)
+                break
+        if result.force_all:
             break
 
         # Non-executable comment/blank-only edit: skip coverage selection, but
@@ -423,8 +478,16 @@ def select(
             # Unchanged diff context is not a coverage seed. Pure insertions use
             # the enclosing function at the insertion point. Function-span
             # coverage is a fallback for empty hits and control-flow edits.
-            bodies = change.added_bodies + change.removed_bodies
-            control_flow = any(CONTROL_FLOW.search(b) for b in bodies)
+            # Expand to the enclosing function only when a control-flow word
+            # was added or removed. A word that stays on the line (an `if`
+            # whose condition changed) is an ordinary line seed.
+            removed_kw = {
+                kw for b in change.removed_bodies for kw in CONTROL_FLOW.findall(b)
+            }
+            added_kw = {
+                kw for b in change.added_bodies for kw in CONTROL_FLOW.findall(b)
+            }
+            control_flow = removed_kw != added_kw
             pure_insert = not change.old_lines and any(
                 COMMENT_OR_BLANK.match(b) is None for b in change.added_bodies
             )
@@ -461,10 +524,10 @@ def select(
                 if ordinary_replace and not hit and "func" in use:
                     hit |= cov.tests_for_functions(path, anchor, ranges)
                     result.reasons.append(f"func_fallback:{path}")
-                # File-level for class/module body, except nested Tokenizer/
-                # Parser/Generator tool classes (file union is huge & noisy).
-                if "file" in use and class_body and not nested_tooling:
-                    hit |= cov.tests_for_file(path)
+                # Whole-file coverage for class and module body added tests
+                # that caught no sample failure and cost 7.252s. Changed lines
+                # and enclosing functions still seed. Nested tooling classes
+                # stay on their own line hits.
                 result.numbers.update(hit)
                 result.reasons.append(
                     f"cov:{path}:{len(hit)}:{'class' if class_body else 'func'}"
@@ -569,11 +632,276 @@ def select(
         result.numbers = set(all_numbers)
         return result
 
-    for path in selected_files:
-        nums = file_to_numbers.get(path)
-        if nums:
-            result.numbers.update(nums)
+    routed = _pool_route_ids(changes, impact)
+    if routed is not None:
+        seeds = set(result.numbers)
+        for test_id in _suppressed_executor_ids(patch, changes, impact):
+            number = id_to_number.get(test_id)
+            if number is not None and number not in seeds:
+                routed.discard(test_id)
+    if routed is None:
+        for path in selected_files:
+            nums = file_to_numbers.get(path)
+            if nums:
+                result.numbers.update(nums)
+        return result
+
+    missing = [test_id for test_id in routed if test_id not in id_to_number]
+    if missing:
+        result.force_all = True
+        result.reasons.append(f"pool_route_id_mismatch:{len(missing)}")
+        result.numbers = set(all_numbers)
+        return result
+    result.numbers.update(id_to_number[test_id] for test_id in routed)
+    result.reasons.append(f"pool_routes:{len(routed)}")
     return result
+
+
+# Pinned assignments of Context._table are None or a Table, and Table does not
+# define __eq__, so identity and equality with None have the same result.
+_NONE_IDENTITY = {("sqlglot/executor/context.py", "self._table")}
+_NONE_COMPARE = re.compile(r"^(?P<left>.*?) (?P<op>is not|is|==|!=) None\b(?P<right>.*)$")
+
+
+def _canonicalize_none_compare(body: str) -> str | None:
+    match = _NONE_COMPARE.match(body.strip())
+    if match is None:
+        return None
+    op = "==" if match.group("op") in {"is", "=="} else "!="
+    return f"{match.group('left')} {op} None{match.group('right')}"
+
+
+def _none_identity_edit(change: FileChange) -> bool:
+    """True when the edit cannot change a None test for a vetted operand."""
+    path = change.old_path
+    if (
+        path != change.new_path
+        or len(change.removed_bodies) != 1
+        or len(change.added_bodies) != 1
+        or change.removed_bodies[0] == change.added_bodies[0]
+    ):
+        return False
+    removed = _canonicalize_none_compare(change.removed_bodies[0])
+    added = _canonicalize_none_compare(change.added_bodies[0])
+    if removed is None or removed != added:
+        return False
+    match = _NONE_COMPARE.match(change.removed_bodies[0].strip())
+    if match is None:
+        return False
+    left = match.group("left").rstrip()
+    return any(
+        left == operand or left.endswith(operand) and not left[: -len(operand)].endswith(("_",))
+        and (len(left) == len(operand) or not left[-len(operand) - 1].isalnum())
+        for allowed, operand in _NONE_IDENTITY
+        if allowed == path
+    )
+
+
+_PLAIN_COMMENT = re.compile(r"#[ ]+[A-Za-z][A-Za-z ,.-]*\Z")
+_DIRECTIVE = re.compile(r"(?i)noqa|type|coding|pragma|fmt|lint|pylint|ruff|pyright|mypy")
+
+
+def _neutral_import_comment_paths(patch: str, changes: list[FileChange]) -> set[str]:
+    """Plain comments inserted between imports. The parsed tree would not change."""
+    candidates = {
+        change.old_path
+        for change in changes
+        if change.old_path
+        and change.old_path == change.new_path
+        and change.old_path.startswith("sqlglot/")
+        and change.old_path.endswith(".py")
+        and not change.removed_bodies
+        and change.added_bodies
+    }
+    accepted: set[str] = set()
+    rejected: set[str] = set()
+    path: str | None = None
+    hunk: list[str] = []
+
+    def finish_hunk() -> None:
+        if path not in candidates or not hunk:
+            return
+        for index, line in enumerate(hunk):
+            if not line.startswith("+"):
+                continue
+            body = line[1:]
+            previous = next(
+                (hunk[pos][1:] for pos in range(index - 1, -1, -1) if hunk[pos].startswith(" ")),
+                "",
+            )
+            nxt = next(
+                (hunk[pos][1:] for pos in range(index + 1, len(hunk)) if hunk[pos].startswith(" ")),
+                "",
+            )
+            plain = (
+                previous.startswith(("import ", "from "))
+                and nxt.startswith(("import ", "from "))
+                and _PLAIN_COMMENT.fullmatch(body) is not None
+                and _DIRECTIVE.search(body) is None
+            )
+            if plain:
+                accepted.add(path)
+            else:
+                rejected.add(path)
+
+    for line in patch.splitlines():
+        header = DIFF_FILE_RE.match(line)
+        if header:
+            finish_hunk()
+            path = header.group(1)
+            hunk = []
+            continue
+        if HUNK_RE.match(line):
+            finish_hunk()
+            hunk = []
+            continue
+        if line.startswith(("+++", "---")):
+            continue
+        if path in candidates and line.startswith(("+", "-", " ")):
+            hunk.append(line)
+    finish_hunk()
+    return {item for item in accepted if item not in rejected}
+
+
+def _in_function(impact: ImpactMaps, path: str, line: int) -> bool:
+    return any(
+        row.get("kind") == "FunctionDef" and row["start"] < line <= row["end"]
+        for row in impact.function_ranges.get(path, ())
+    )
+
+
+def _optimizer_body_edits(changes: list[FileChange], impact: ImpactMaps) -> bool:
+    python_changes = [change for change in changes if (change.old_path or "").endswith(".py")]
+    if not python_changes:
+        return False
+    for change in python_changes:
+        path = change.old_path
+        if (
+            path != change.new_path
+            or not path
+            or not path.startswith(("sqlglot/optimizer/", "sqlglot/executor/"))
+            or not change.old_lines
+            or not change.added_bodies
+            or change.structural
+        ):
+            return False
+        if not all(_in_function(impact, path, line) for line in change.old_lines):
+            return False
+    return True
+
+
+def _isolated_bool_target(changes: list[FileChange], impact: ImpactMaps) -> str | None:
+    """One boolean literal inside an optimizer assignment, as path:function."""
+    if len(changes) != 1:
+        return None
+    change = changes[0]
+    path = change.old_path
+    if not (
+        path
+        and path == change.new_path
+        and path.startswith("sqlglot/optimizer/")
+        and len(change.old_lines) == len(change.added_bodies) == len(change.removed_bodies) == 1
+        and not change.structural
+    ):
+        return None
+    removed, added = change.removed_bodies[0], change.added_bodies[0]
+    if len(removed) - len(removed.lstrip()) != len(added) - len(added.lstrip()):
+        return None
+    try:
+        before = ast.parse(removed.strip()).body[0]
+        after = ast.parse(added.strip()).body[0]
+    except (SyntaxError, IndexError):
+        return None
+    if not isinstance(before, ast.Assign) or not isinstance(after, ast.Assign):
+        return None
+    for statement in (before, after):
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Constant) and type(node.value) is bool:
+                node.value = False
+    if ast.dump(before) != ast.dump(after):
+        return None
+    body_line = next(iter(change.old_lines))
+    scopes = [
+        row
+        for row in impact.function_ranges.get(path, ())
+        if row.get("kind") == "FunctionDef" and row["start"] < body_line <= row["end"]
+    ]
+    if not scopes:
+        return None
+    name = min(scopes, key=lambda row: row["end"] - row["start"])["name"]
+    return f"{path}:{name}"
+
+
+def _suppressed_executor_ids(
+    patch: str, changes: list[FileChange], impact: ImpactMaps
+) -> set[str]:
+    """Executor pool ids the pinned fixtures never exercise for this diff.
+
+    Line seeds and serde routes are left in place by the caller. Missing
+    activity data suppresses nothing.
+    """
+    data = impact.pool_routes or {}
+    executor_ids = set(data.get("executor_ids") or [])
+    activity = data.get("executor_activity") or {}
+    calls = data.get("executor_calls") or {}
+    if not executor_ids or not activity:
+        return set()
+    deps = set(data.get("executor_deps") or [])
+    eligible = any(
+        path
+        and path.startswith(("sqlglot/optimizer/", "sqlglot/executor/"))
+        and impact.path_to_module.get(path) in deps
+        for change in changes
+        for path in (change.old_path, change.new_path)
+    )
+    neutral = _neutral_import_comment_paths(patch, changes)
+    remaining = [change for change in changes if change.old_path not in neutral]
+    drop: set[str] = set()
+    if neutral and eligible:
+        kept = _pool_route_ids(remaining, impact) or set()
+        drop |= executor_ids - kept
+    if eligible and _optimizer_body_edits(remaining, impact):
+        drop |= {test_id for test_id, active in activity.items() if active == 0}
+    target = _isolated_bool_target(changes, impact)
+    if target and eligible and calls:
+        drop |= {test_id for test_id, names in calls.items() if target not in names}
+    return drop & executor_ids
+
+
+def _pool_route_ids(changes: list[FileChange], impact: ImpactMaps) -> set[str] | None:
+    """Pinned-base tests that send work to spawned pools. None if the map lacks routes."""
+    data = impact.pool_routes
+    routes = data.get("routes") if data else None
+    if not routes:
+        return None
+    executor_ids = set(data.get("executor_ids") or [])
+    executor_deps = set(data.get("executor_deps") or [])
+    picked: set[str] = set()
+    for change in changes:
+        for path in {p for p in (change.old_path, change.new_path) if p}:
+            if not path.startswith("sqlglot/"):
+                continue
+            module = impact.path_to_module.get(path)
+            if path == "sqlglot/serde.py" or path.startswith("sqlglot/serde"):
+                picked.update(route["id"] for route in routes)
+                picked.update(executor_ids)
+                continue
+            if path.startswith(("sqlglot/optimizer/", "sqlglot/executor/")):
+                if module:
+                    picked.update(
+                        route["id"] for route in routes if module in route.get("deps", [])
+                    )
+                if (module and module in executor_deps) or path.startswith("sqlglot/executor/"):
+                    picked.update(executor_ids)
+                continue
+            dialect = dialect_from_path(path)
+            if dialect:
+                picked.update(
+                    route["id"]
+                    for route in routes
+                    if dialect in route.get("dialects", [])
+                )
+    return picked
 
 
 def main() -> None:
