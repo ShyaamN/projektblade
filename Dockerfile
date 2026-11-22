@@ -6,7 +6,8 @@ WORKDIR /app
 # Permitted static maps from pinned sqlglot (no patch→answer tables).
 COPY maps/impact.json /app/maps/impact.json
 COPY maps/coverage.json.gz /app/maps/coverage.json.gz
-COPY selector.py /app/selector.py
+COPY maps/pinpoint.marshal.gz /app/maps/pinpoint.marshal.gz
+COPY selector.py pinpoint.py /app/
 
 # Runtime user is nobody — maps must be world-readable.
 RUN chmod -R a+rX /app

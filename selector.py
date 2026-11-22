@@ -17,6 +17,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pinpoint import Index as PinpointIndex
+
 DATA = Path("/data")
 APP_DIR = Path(__file__).resolve().parent
 if not DATA.exists():
@@ -26,6 +28,7 @@ IMPACT_PATH = APP_DIR / "maps" / "impact.json"
 COV_GZ_PATH = APP_DIR / "maps" / "coverage.json.gz"
 COV_META_PATH = APP_DIR / "maps" / "covmeta.json"
 COV_BIN_PATH = APP_DIR / "maps" / "covpostings.bin"
+PINPOINT_PATH = APP_DIR / "maps" / "pinpoint.marshal.gz"
 PINNED_SHA = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 
 DIFF_FILE_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)\s*$")
@@ -205,15 +208,25 @@ class CoverageIndex:
         except Exception as exc:  # noqa: BLE001
             idx.error = f"coverage_unreadable:{exc}"
             return idx
+        return cls.from_data(raw)
+
+    @classmethod
+    def from_data(cls, raw: dict, *, integer_lines: bool = False) -> CoverageIndex:
+        idx = cls()
         idx.pinned_sha = str(raw.get("pinned_sha", ""))
         idx.test_ids = list(raw.get("test_ids") or [])
         idx.format_name = str(raw.get("format") or "coverage.json.gz")
         if idx.pinned_sha != PINNED_SHA:
             idx.error = "coverage_sha_mismatch"
             return idx
-        for name, lines in raw.get("files", {}).items():
-            idx.file_lines[name] = {int(line): list(nums) for line, nums in lines.items()}
-        idx.fixtures = {k: list(v) for k, v in raw.get("fixtures", {}).items()}
+        if integer_lines:
+            idx.file_lines = raw.get("files", {})
+        else:
+            idx.file_lines = {
+                name: {int(line): nums for line, nums in lines.items()}
+                for name, lines in raw.get("files", {}).items()
+            }
+        idx.fixtures = raw.get("fixtures", {})
         idx.file_count = len(idx.file_lines)
         if not idx.file_lines:
             idx.error = "coverage_empty"
@@ -361,6 +374,7 @@ def select(
     all_numbers: set[int],
     file_to_numbers: dict[str, list[int]],
     sources: set[str] | None = None,
+    pinpoint: PinpointIndex | None = None,
 ) -> Selection:
     # Ablation toggles. Production keeps every source.
     use = sources or {"old", "context", "func", "static", "neighbors", "file"}
@@ -378,6 +392,34 @@ def select(
         if len(identity) == len(changes):
             return result
         changes = [change for change in changes if change not in identity]
+
+    if pinpoint is not None:
+        broad = []
+        allow_equivalence = len(changes) == 1
+        for change in changes:
+            if change.old_path == "sqlglot/serde.py" or (
+                change.old_path == change.new_path
+                and change.old_path
+                and not change.old_path.startswith(("sqlglot/optimizer/", "sqlglot/typing/"))
+                and is_nonexecutable_edit(change)
+                and _pool_route_ids([change], impact) == set()
+            ):
+                broad.append(change)
+                continue
+            hit = pinpoint.narrow(patch, change, allow_equivalence=allow_equivalence)
+            if hit is None:
+                broad.append(change)
+                continue
+            result.numbers.update(hit)
+            result.reasons.append(f"verified_source:{change.old_path}:{len(hit)}")
+        if len(broad) != len(changes):
+            # The child collector explicitly records exceptions. Preserve any
+            # such tests that the original envelope would have kept.
+            original = select(patch, cov, impact, id_to_number, all_numbers, file_to_numbers, sources)
+            result.numbers.update(original.numbers & pinpoint.preserve)
+        changes = broad
+        if not changes:
+            return result
 
     selected_files: set[str] = set()
 
@@ -925,7 +967,12 @@ def main() -> None:
 
     runtime_ids = [t["id"] for t in tests_raw]
     impact = ImpactMaps.load(set(id_to_number))
-    cov = CoverageIndex.load()
+    pinpoint = PinpointIndex.load(PINPOINT_PATH, id_to_number, PINNED_SHA)
+    cov = (
+        CoverageIndex.from_data(pinpoint.primary, integer_lines=True)
+        if pinpoint is not None and pinpoint.primary is not None
+        else CoverageIndex.load()
+    )
     fallback = cov.error or impact.map_error or "none"
     if cov.ok and cov.test_ids != runtime_ids:
         cov.ok = False
@@ -954,7 +1001,7 @@ def main() -> None:
             selection = Selection(numbers=set(all_numbers), force_all=True, reasons=[fallback])
         else:
             selection = select(
-                patch, cov, impact, id_to_number, all_numbers, file_to_numbers
+                patch, cov, impact, id_to_number, all_numbers, file_to_numbers, pinpoint=pinpoint
             )
         if selection.force_all:
             workers = full_schedule
