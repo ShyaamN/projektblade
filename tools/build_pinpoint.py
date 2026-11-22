@@ -328,6 +328,13 @@ def main():
             "unobserved": sorted(number[test] for test in tokenizer["unobserved"]),
             "keys": {key: sorted(number[test] for test in tests) for key, tests in tokenizer["keys"].items()},
         }
+    parser_observations = maps / "parser-tokens.json"
+    if parser_observations.exists():
+        profile = json.loads(parser_observations.read_text(encoding="utf-8"))
+        if profile["pinned_sha"] != PINNED or profile["test_ids"] != coverage["test_ids"]:
+            raise RuntimeError("Parser input inventory mismatch")
+        number = {test: n for n, test in enumerate(coverage["test_ids"])}
+        packaged["parser_comment_free"] = sorted(number[node] for node in profile["comment_free"])
     data = marshal.dumps(packaged, 4, allow_code=False)
     (maps / "pinpoint.marshal.gz").write_bytes(gzip.compress(data, mtime=0))
 

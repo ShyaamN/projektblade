@@ -409,6 +409,7 @@ class Selection:
     force_all: bool = False
     reasons: list[str] = field(default_factory=list)
     slack_candidates: set[int] = field(default_factory=set)
+    excluded: set[int] = field(default_factory=set)
 
 
 def select(
@@ -442,6 +443,10 @@ def select(
             result.reasons.append(reason)
             result.numbers = set(all_numbers)
             return result
+        if len(changes) == 1:
+            result.excluded = pinpoint.comment_free_tests(validated)
+            if result.excluded:
+                result.reasons.append("parser_comment_free_inputs")
         if test_changes:
             path, = test_changes
             result.numbers.update(test_changes[path])
@@ -1100,6 +1105,8 @@ def main() -> None:
             workers = full_schedule
             n = len(tests)
         else:
+            selection.numbers.difference_update(selection.excluded)
+            selection.slack_candidates.difference_update(selection.excluded)
             selected = [by_number[n] for n in sorted(selection.numbers) if n in by_number]
             workers = schedule(selected)
             retain_within_slack(workers, selection.slack_candidates, by_number)

@@ -6,7 +6,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pinpoint import Index, _predicate_entry, classify_line, local_effect_lines
+from pinpoint import Index, _predicate_entry, classify_line, local_effect_lines, table_comment_operations_only
 from selector import parse_unified_diff
 
 
@@ -55,6 +55,24 @@ def check():
     assert local_effect_lines(original, edited.replace("return result * 2", "return (y := result)")) is None
     assert local_effect_lines(original, edited.replace("def f(x):", "def f(x=1):")) is None
     assert local_effect_lines(original, edited.replace("result = (", "self.result = (")) is None
+
+    original = '''class Parser:
+    def _parse_table_parts_fast(self):
+        comments = self._prev_comments
+        if has_dot and self._prev_comments:
+            comments = comments + self._prev_comments
+        return comments
+
+    def _parse_table_parts(self):
+        while self._match(TokenType.DOT, expression=table if isinstance(table, exp.Expr) else None):
+            continue
+'''
+    plain = original.replace("        if has_dot and self._prev_comments:\n"
+                             "            comments = comments + self._prev_comments\n", "")
+    plain = plain.replace(", expression=table if isinstance(table, exp.Expr) else None", "")
+    assert table_comment_operations_only(original, plain)
+    assert not table_comment_operations_only(original, plain.replace("return comments", "return []"))
+    assert not table_comment_operations_only(original, original.replace("TokenType.DOT", "TokenType.COMMA"))
 
 
 if __name__ == "__main__":

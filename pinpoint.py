@@ -343,6 +343,44 @@ def local_effect_lines(original: str, updated: str) -> list[set[int]] | None:
     return sites if compare(_ast(original), _ast(updated)) and sites else None
 
 
+def table_comment_operations_only(original: str, updated: str) -> bool:
+    """Prove that a table parser edit only moves comments on dot separators."""
+    combine = ast.parse("if has_dot and self._prev_comments:\n    comments = comments + self._prev_comments").body[0]
+    attach = ast.parse(
+        "self._match(TokenType.DOT, expression=table if isinstance(table, exp.Expr) else None)",
+        mode="eval",
+    ).body
+    bare_match = ast.parse("self._match(TokenType.DOT)", mode="eval").body
+
+    class WithoutComments(ast.NodeTransformer):
+        def __init__(self, method):
+            self.method = method
+
+        def visit_If(self, node):
+            if self.method == "_parse_table_parts_fast" and _same(combine, node):
+                return None
+            return self.generic_visit(node)
+
+        def visit_Call(self, node):
+            if self.method == "_parse_table_parts" and _same(attach, node):
+                return bare_match
+            return self.generic_visit(node)
+
+    trees = [_ast(original), _ast(updated)]
+    if _same(*trees):
+        return False
+    for tree in trees:
+        for directive in tree.type_ignores:
+            directive.lineno = 0
+        parser = next((node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Parser"), None)
+        if parser is None:
+            return False
+        for method in parser.body:
+            if isinstance(method, ast.FunctionDef) and method.name in {"_parse_table_parts", "_parse_table_parts_fast"}:
+                WithoutComments(method.name).visit(method)
+    return _same(*trees)
+
+
 def classify_line(path: str, original: str, line: int, replacement: str) -> str | None:
     """Return exact-line eligibility for a local condition or assignment value."""
     lines = original.splitlines()
@@ -484,6 +522,7 @@ class Index:
     show_flag_sites: dict | None = None
     isolated_test_methods: dict | None = None
     filtered_sql_fixtures: dict | None = None
+    parser_comment_free: set[int] | None = None
 
     @classmethod
     def load(cls, path: Path, ids: dict[str, int], sha: str) -> Index | None:
@@ -497,7 +536,7 @@ class Index:
                        data.get("test_sources"), data.get("import_test_files"),
                        data.get("multiline_literals"), data.get("expression_flag_sites"),
                        data.get("show_flag_sites"), data.get("isolated_test_methods"),
-                       data.get("filtered_sql_fixtures"))
+                       data.get("filtered_sql_fixtures"), set(data.get("parser_comment_free", ())))
         except (OSError, EOFError, ValueError, KeyError, TypeError):
             return None
 
@@ -506,6 +545,13 @@ class Index:
         if posting is None:
             return set()
         return {n for n, in struct.iter_unpack("<H", base64.b64decode(posting))}
+
+    def comment_free_tests(self, validated: dict[str, str]) -> set[int]:
+        path = "sqlglot/parser.py"
+        output = validated.get(path)
+        if self.parser_comment_free and output is not None and table_comment_operations_only(self.sources[path], output):
+            return self.parser_comment_free
+        return set()
 
     def fixture_equivalent(self, patch: str, change) -> bool:
         path = change.old_path
