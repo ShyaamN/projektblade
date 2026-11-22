@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import struct
+import zlib
 
 
 _FILE = re.compile(r"diff --git a/(\S+) b/(\S+)\Z")
@@ -24,6 +25,10 @@ _VERSION = re.compile(
     r"(?P<left>\bself\.dialect\.version\s+)(?P<op><=|>=|<|>)"
     r"(?P<right>\s+\(\d+,\s*\d+\))"
 )
+
+
+def unpack_lines(value: bytes) -> dict:
+    return marshal.loads(zlib.decompress(value), allow_code=False)
 
 
 def _patched_source(path: str, source: str, patch: str) -> str | None:
@@ -80,7 +85,35 @@ def _patched_source(path: str, source: str, patch: str) -> str | None:
     return "\n".join([*output, *lines[cursor:]]) + "\n"
 
 
-def python_risk(patch: str, changes, sources: dict) -> str | None:
+def _only_test_bodies_changed(before: str, after: str) -> bool:
+    trees = [_ast(before), _ast(after)]
+    for tree in trees:
+        scopes = list(tree.body)
+        while scopes:
+            node = scopes.pop()
+            if isinstance(node, ast.ClassDef):
+                scopes.extend(node.body)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+                if node.decorator_list:
+                    continue
+                node.body = []
+    return _same(*trees)
+
+
+def _import_time_raises(source: str) -> list[str]:
+    pending = [_ast(source)]
+    raises = []
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if isinstance(node, ast.Raise):
+            raises.append(ast.dump(node))
+        pending.extend(ast.iter_child_nodes(node))
+    return raises
+
+
+def python_risk(patch: str, changes, index: Index, validated: dict[str, str]) -> str | None:
     """Full-suite reason when a Python edit cannot be reconstructed and compiled.
 
     ``compile`` does not execute the file. A rename, deletion, mismatched hunk,
@@ -92,15 +125,36 @@ def python_risk(patch: str, changes, sources: dict) -> str | None:
             continue
         if old != new:
             return "python_path_changed"
-        if old not in sources:
+        original = index.sources.get(old)
+        if original is None and index.test_sources and old in index.test_sources:
+            original = zlib.decompress(index.test_sources[old]).decode("utf-8")
+        if original is None:
             return "python_source_missing"
-        output = _patched_source(old, sources[old], patch)
+        output = _patched_source(old, original, patch)
         if output is None:
             return "python_context"
         try:
-            compile(output, old, "exec")
+            # The anchored source and precomputed comparison site establish
+            # syntax when the sole edit exchanges equivalent operator tokens.
+            same_operator = (
+                len(changes) == 1
+                and len(change.old_lines) == len(change.added_bodies) == len(change.removed_bodies) == 1
+                and next(iter(change.old_lines)) in (index.operator_lines or {}).get(old, ())
+                and _same_operator(old, change.removed_bodies[0], change.added_bodies[0])
+            )
+            if not same_operator:
+                compile(output, old, "exec", dont_inherit=True)
+            if old.startswith("tests/") and not _only_test_bodies_changed(original, output):
+                return "python_test_collection"
+            if old.startswith("sqlglot/"):
+                if old.endswith("/__init__.py") and not _same(_ast(original), _ast(output)):
+                    return "python_package_init"
+                if any(re.match(r"\s*raise\b", line) for line in change.added_bodies):
+                    if _import_time_raises(original) != _import_time_raises(output):
+                        return "python_import_raise"
         except (SyntaxError, ValueError):
             return "python_syntax"
+        validated[old] = output
     return None
 
 
@@ -118,7 +172,12 @@ def _same(left, right) -> bool:
                 return False
         return True
     if isinstance(left, list):
-        return len(left) == len(right) and all(_same(a, b) for a, b in zip(left, right))
+        if len(left) != len(right):
+            return False
+        for first, second in zip(left, right):
+            if not _same(first, second):
+                return False
+        return True
     return left == right
 
 
@@ -297,6 +356,7 @@ class Index:
     tokenizer: dict | None
     primary: dict | None = None
     operator_lines: dict | None = None
+    test_sources: dict | None = None
 
     @classmethod
     def load(cls, path: Path, ids: dict[str, int], sha: str) -> Index | None:
@@ -306,7 +366,8 @@ class Index:
             if data["schema"] != 3 or data["pinned_sha"] != sha or data["test_ids"] != list(ids):
                 return None
             return cls(data["sources"], data["lines"], set(map(ids.__getitem__, data["preserve"])),
-                       data.get("tokenizer"), data.get("primary"), data.get("operator_lines"))
+                       data.get("tokenizer"), data.get("primary"), data.get("operator_lines"),
+                       data.get("test_sources"))
         except (OSError, EOFError, ValueError, KeyError, TypeError):
             return None
 
@@ -316,12 +377,13 @@ class Index:
             return set()
         return {n for n, in struct.iter_unpack("<H", base64.b64decode(posting))}
 
-    def narrow(self, patch, change, *, allow_equivalence: bool = True) -> set[int] | None:
+    def narrow(self, patch, change, *, allow_equivalence: bool = True,
+               validated: dict[str, str] | None = None) -> set[int] | None:
         path = change.old_path
         if path != change.new_path or path not in self.sources:
             return None
         source = self.sources[path]
-        output = _patched_source(path, source, patch)
+        output = validated.get(path) if validated is not None else _patched_source(path, source, patch)
         if output is None:
             return None
         bodies = change.added_bodies + change.removed_bodies

@@ -8,6 +8,7 @@ import marshal
 from pathlib import Path
 import subprocess
 import struct
+import zlib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -70,9 +71,13 @@ def main():
     if primary["pinned_sha"] != PINNED or primary["test_ids"] != coverage["test_ids"]:
         raise RuntimeError("Parent coverage inventory mismatch")
     primary["files"] = {
-        path: {int(line): hits for line, hits in bucket.items()}
+        path: zlib.compress(
+            marshal.dumps({int(line): hits for line, hits in bucket.items()}, 4, allow_code=False),
+            level=1,
+        )
         for path, bucket in primary["files"].items()
     }
+    primary["packed_files"] = True
     packaged = {
         "schema": 3,
         "pinned_sha": PINNED,
@@ -82,6 +87,11 @@ def main():
         "preserve": sorted(preserve),
         "primary": primary,
         "operator_lines": operator_lines,
+        "test_sources": {
+            path: zlib.compress((base / path).read_text(encoding="utf-8").encode())
+            for path in sorted({node.split("::", 1)[0] for node in coverage["test_ids"]})
+            if path.startswith("tests/") and path.endswith(".py") and (base / path).is_file()
+        },
     }
     observations = maps / "tokenizer-observations.json"
     if observations.exists():

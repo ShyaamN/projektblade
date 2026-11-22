@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import difflib
 import json
 import sys
 from pathlib import Path
+import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -61,6 +63,35 @@ def main() -> int:
     selected = choose(syntax, loaded)
     assert selected.force_all and selected.numbers == numbers, selected.reasons
     assert selected.reasons[0] == "python_syntax"
+
+    raises = original.replace("import logging\n", "raise RuntimeError('test')\nimport logging\n", 1)
+    compile(raises, path, "exec")
+    selected_import = choose(patch_for(path, original, raises), loaded)
+    assert selected_import.force_all and selected_import.numbers == numbers, selected_import.reasons
+
+    test_path = "tests/test_parser.py"
+    test_source = zlib.decompress(pinpoint.test_sources[test_path]).decode("utf-8")
+    method = next(
+        node for node in ast.walk(ast.parse(test_source))
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")
+    )
+    lines = test_source.splitlines()
+    first_line = method.body[0].lineno - 1
+    prefix = lines[first_line][:len(lines[first_line]) - len(lines[first_line].lstrip())]
+    lines.insert(first_line, prefix + "raise AssertionError('test body mutation')")
+    body = choose(patch_for(test_path, test_source, "\n".join(lines)), loaded)
+    assert not body.force_all and body.numbers == set(loaded[5][test_path]), body.reasons
+    collection = choose(
+        patch_for(test_path, test_source, "raise RuntimeError('collection')\n" + test_source),
+        loaded,
+    )
+    assert collection.force_all, collection.reasons
+
+    workers = [[0], [1]]
+    selector.retain_within_slack(
+        workers, {0, 2, 3}, {0: {"ms": 10}, 1: {"ms": 3}, 2: {"ms": 7}, 3: {"ms": 8}},
+    )
+    assert workers == [[0], [1, 2]]
 
     ordinary = (ROOT / "sample" / "commits" / "2jrq.patch").read_text(encoding="utf-8")
     routine = choose(ordinary, loaded)

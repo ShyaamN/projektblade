@@ -14,11 +14,13 @@ import math
 import re
 import struct
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from pinpoint import Index as PinpointIndex
 from pinpoint import python_risk
+from pinpoint import unpack_lines
 
 DATA = Path("/data")
 APP_DIR = Path(__file__).resolve().parent
@@ -67,6 +69,22 @@ def schedule(tests: list[dict], max_workers: int = 8) -> list[list[int]]:
             best_workers = workers
     assert best_workers is not None
     return [w for w in best_workers if w]
+
+
+def retain_within_slack(workers: list[list[int]], candidates: set[int], tests: dict[int, dict]) -> None:
+    """Keep more originally plausible tests without changing worker cost."""
+    if len(workers) < 2 or not candidates:
+        return
+    scheduled = {n for worker in workers for n in worker}
+    loads = [sum(tests[n]["ms"] for n in worker) for worker in workers]
+    limit = max(loads)
+    for n in sorted(candidates - scheduled, key=lambda n: (tests[n]["ms"], n)):
+        worker = loads.index(min(loads))
+        duration = tests[n]["ms"]
+        if loads[worker] + duration > limit:
+            break
+        workers[worker].append(n)
+        loads[worker] += duration
 
 
 @dataclass
@@ -183,6 +201,26 @@ def is_nonexecutable_edit(change: FileChange) -> bool:
     return all(COMMENT_OR_BLANK.match(b) is not None for b in bodies)
 
 
+class PackedCoverageFiles(Mapping):
+    def __init__(self, files):
+        self.files = files
+        self.cache = {}
+
+    def __getitem__(self, path):
+        if path not in self.cache:
+            self.cache[path] = unpack_lines(self.files[path])
+        return self.cache[path]
+
+    def __iter__(self):
+        return iter(self.files)
+
+    def __len__(self):
+        return len(self.files)
+
+    def __contains__(self, path):
+        return path in self.files
+
+
 class CoverageIndex:
     def __init__(self) -> None:
         self.ok = False
@@ -220,7 +258,9 @@ class CoverageIndex:
         if idx.pinned_sha != PINNED_SHA:
             idx.error = "coverage_sha_mismatch"
             return idx
-        if integer_lines:
+        if raw.get("packed_files"):
+            idx.file_lines = PackedCoverageFiles(raw["files"])
+        elif integer_lines:
             idx.file_lines = raw.get("files", {})
         else:
             idx.file_lines = {
@@ -365,6 +405,7 @@ class Selection:
     numbers: set[int] = field(default_factory=set)
     force_all: bool = False
     reasons: list[str] = field(default_factory=list)
+    slack_candidates: set[int] = field(default_factory=set)
 
 
 def select(
@@ -387,9 +428,10 @@ def select(
         result.numbers = set(all_numbers)
         return result
 
+    validated: dict[str, str] = {}
     if pinpoint is not None:
         # Reconstruct and compile before any empty or narrowed selection.
-        reason = python_risk(patch, changes, pinpoint.sources)
+        reason = python_risk(patch, changes, pinpoint, validated)
         if reason:
             result.force_all = True
             result.reasons.append(reason)
@@ -416,7 +458,7 @@ def select(
             ):
                 broad.append(change)
                 continue
-            hit = pinpoint.narrow(patch, change, allow_equivalence=allow_equivalence)
+            hit = pinpoint.narrow(patch, change, allow_equivalence=allow_equivalence, validated=validated)
             if hit is None:
                 broad.append(change)
                 continue
@@ -427,6 +469,8 @@ def select(
             # such tests that the original envelope would have kept.
             original = select(patch, cov, impact, id_to_number, all_numbers, file_to_numbers, sources)
             result.numbers.update(original.numbers & pinpoint.preserve)
+            if not original.force_all:
+                result.slack_candidates.update(original.numbers)
         changes = broad
         if not changes:
             return result
@@ -460,7 +504,7 @@ def select(
 
         # Non-executable comment/blank-only edit: skip coverage selection, but
         # still apply static envelopes for optimizer/typing hubs.
-        if is_nonexecutable_edit(change):
+        if is_nonexecutable_edit(change) and not any(path in file_to_numbers for path in paths):
             result.reasons.append(f"nonexec:{next(iter(paths))}")
             for path in paths:
                 if path.startswith("sqlglot/optimizer/"):
@@ -987,12 +1031,8 @@ def main() -> None:
     if cov.ok and cov.test_ids != runtime_ids:
         cov.ok = False
         fallback = "coverage_test_id_order_mismatch"
-    impact_ids = []
-    if IMPACT_PATH.exists():
-        impact_ids = list(json.loads(IMPACT_PATH.read_text(encoding="utf-8")).get("test_ids") or [])
-    if impact.map_ok and impact_ids != runtime_ids:
-        impact.map_ok = False
-        fallback = "impact_test_id_order_mismatch"
+    # Impact map references use pytest IDs, while the coverage artifacts above
+    # already enforce ordered IDs for their integer postings.
     if not cov.ok or not impact.map_ok:
         # Full suite on every commit. select() still runs, but main overrides.
         fallback = fallback if fallback != "none" else "map_invalid"
@@ -1019,7 +1059,8 @@ def main() -> None:
         else:
             selected = [by_number[n] for n in sorted(selection.numbers) if n in by_number]
             workers = schedule(selected)
-            n = len(selected)
+            retain_within_slack(workers, selection.slack_candidates, by_number)
+            n = sum(map(len, workers))
         print(
             json.dumps(
                 {"commit": patch_path.stem, "workers": workers},
