@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import ast
 import base64
+import builtins
 import gzip
 from io import BytesIO
+import keyword
 import marshal
 from dataclasses import dataclass
 from pathlib import Path
@@ -135,21 +137,51 @@ def _test_body_changes(before: str, after: str) -> tuple[set[str], bool] | None:
     return changed, all(_terminal_assertion_change(bodies[0][name], bodies[1][name]) for name in changed)
 
 
-def _import_time_operations(source: str) -> list[str]:
-    pending = [_ast(source)]
-    operations = []
+def _eager_nodes(tree: ast.AST):
+    pending = [tree]
     while pending:
         node = pending.pop()
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            pending.extend(reversed(node.decorator_list))
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            pending.extend(arg for arg in node.args.defaults + node.args.kw_defaults if arg is not None)
             continue
-        if isinstance(node, (ast.Import, ast.ImportFrom, ast.Raise)):
-            operations.append(ast.dump(node))
         pending.extend(reversed(list(ast.iter_child_nodes(node))))
-    return operations
+
+
+def _import_time_operations(source: str) -> list[str]:
+    return [ast.dump(node) for node in _eager_nodes(_ast(source))
+            if isinstance(node, (ast.Import, ast.ImportFrom, ast.Raise))]
 
 
 _IMPORT_OPERATION = re.compile(r"\s*(?:import|from|raise)\b")
 _COMMENT_OR_BLANK = re.compile(r"\s*(?:#.*)?\Z")
+_IDENTIFIER = re.compile(r"\b[A-Za-z_]\w*\b")
+_IMPLICIT_NAMES = frozenset(vars(builtins)) | frozenset(keyword.kwlist) | {
+    "__file__", "__cached__", "__package__", "__loader__", "__spec__", "__annotations__",
+}
+
+
+def _unbound_eager_name(change, original: str, output: str) -> bool:
+    candidates = set(_IDENTIFIER.findall("\n".join(change.added_bodies))) - _IMPLICIT_NAMES
+    new = {name for name in candidates if name not in original}
+    if not new:
+        return False
+    tree = _ast(output)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.alias):
+            if node.name == "*":
+                return False
+            new.discard(node.asname or node.name.split(".", 1)[0])
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            new.discard(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler)):
+            new.discard(node.name)
+        elif isinstance(node, ast.arg):
+            new.discard(node.arg)
+    return bool(new) and any(isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+                             and node.id in new for node in _eager_nodes(tree))
 
 
 def _literal_edit(change, original, output, ranges) -> bool:
@@ -215,7 +247,7 @@ def python_risk(
                 eager_change = any(
                     _IMPORT_OPERATION.match(line) for line in change.added_bodies + change.removed_bodies
                 ) and _import_time_operations(original) != _import_time_operations(output)
-                if eager_change or _literal_edit(
+                if eager_change or _unbound_eager_name(change, original, output) or _literal_edit(
                     change, original, output, (index.multiline_literals or {}).get(old, ()),
                 ):
                     if not index.import_test_files or not index.import_test_files.get(old):

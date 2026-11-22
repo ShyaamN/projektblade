@@ -59,6 +59,10 @@ CASES = (
      '# coding: projektblade_unavailable_codec\n'
      '"""sqlglot expressions core - base classes, traits, operators, and helpers."""',
      "tests/test_parser.py::TestParser::test_union", "unknown encoding"),
+    ("unbound_class_initializer", "sqlglot/expressions/ddl.py",
+     '        "referenced_table": False,',
+     '        "referenced_table": projektblade_unavailable_flag,',
+     "tests/dialects/test_duckdb.py::TestDuckDB::test_create_trigger", "projektblade_unavailable_flag"),
 )
 
 
