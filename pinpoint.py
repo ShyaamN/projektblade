@@ -155,6 +155,35 @@ def _import_time_operations(source: str) -> list[str]:
             if isinstance(node, (ast.Import, ast.ImportFrom, ast.Raise))]
 
 
+def _only_unused_redundant_imports(before, after, output, sites, modified) -> bool:
+    if not sites or len(before) <= len(after):
+        return False
+    next_operation = 0
+    removed = []
+    for old in before:
+        if next_operation < len(after) and after[next_operation] == old:
+            next_operation += 1
+        elif old in sites:
+            removed.append(old)
+        else:
+            return False
+    if next_operation != len(after):
+        return False
+    unresolved = set()
+    operations = set(after)
+    for old in removed:
+        names, proofs = sites[old]
+        if any((parent is not None and parent not in operations) or modified.intersection(dependencies)
+               for parent, dependencies in proofs):
+            return False
+        unresolved.update(names)
+    return not any(
+        isinstance(node, ast.Name) and node.id in unresolved
+        or isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in unresolved
+        for node in ast.walk(_ast(output))
+    )
+
+
 _IMPORT_OPERATION = re.compile(r"\s*(?:import|from|raise)\b")
 _COMMENT_OR_BLANK = re.compile(r"\s*(?:#.*)?\Z")
 _IDENTIFIER = re.compile(r"\b[A-Za-z_]\w*\b")
@@ -203,6 +232,7 @@ def python_risk(
     ``compile`` does not execute the file. A rename, deletion, mismatched hunk,
     or syntax error can fail import or collection for every exposed test.
     """
+    modified = {path for change in changes for path in (change.old_path, change.new_path) if path}
     for change in changes:
         old, new = change.old_path, change.new_path
         if not any(path and path.endswith(".py") for path in (old, new)):
@@ -244,9 +274,13 @@ def python_risk(
             if old.startswith("sqlglot/"):
                 if old.endswith("/__init__.py") and not _same(_ast(original), _ast(output)):
                     return "python_package_init"
-                eager_change = any(
-                    _IMPORT_OPERATION.match(line) for line in change.added_bodies + change.removed_bodies
-                ) and _import_time_operations(original) != _import_time_operations(output)
+                eager_change = False
+                if any(_IMPORT_OPERATION.match(line) for line in change.added_bodies + change.removed_bodies):
+                    before, after = _import_time_operations(original), _import_time_operations(output)
+                    sites = (index.redundant_import_sites or {}).get(old)
+                    eager_change = before != after and not _only_unused_redundant_imports(
+                        before, after, output, sites, modified,
+                    )
                 if eager_change or _unbound_eager_name(change, original, output) or _literal_edit(
                     change, original, output, (index.multiline_literals or {}).get(old, ()),
                 ):
@@ -373,6 +407,54 @@ def local_effect_lines(original: str, updated: str) -> list[set[int]] | None:
         return True
 
     return sites if compare(_ast(original), _ast(updated)) and sites else None
+
+
+def changed_function_bodies(original: str, updated: str) -> list[int] | None:
+    """Recognize unchanged declarations whose existing bodies are the only edit."""
+    trees = [_ast(original), _ast(updated)]
+
+    def functions(tree):
+        result = []
+
+        def inspect(statements):
+            for node in statements:
+                if isinstance(node, ast.ClassDef):
+                    inspect(node.body)
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    result.append((node, node.body, ast.get_docstring(node, clean=False)))
+                    node.body = []
+
+        for directive in tree.type_ignores:
+            directive.lineno = 0
+        inspect(tree.body)
+        return result
+
+    def generator_body(body):
+        pending = body[:]
+        while pending:
+            node = pending.pop()
+            if isinstance(node, (ast.Yield, ast.YieldFrom)):
+                return True
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                pending.extend(ast.iter_child_nodes(node))
+        return False
+
+    before, after = map(functions, trees)
+    if not _same(*trees):
+        return None
+    changed = []
+    for (node, body, doc), (_, replacement, new_doc) in zip(before, after, strict=True):
+        if _same(body, replacement):
+            continue
+        if doc != new_doc or generator_body(body) != generator_body(replacement):
+            return None
+        if node.decorator_list and not all(
+            isinstance(d, ast.Name) and d.id in {"staticmethod", "classmethod", "property"}
+            for d in node.decorator_list
+        ):
+            return None
+        changed.append(node.lineno)
+    return changed or None
 
 
 def table_comment_operations_only(original: str, updated: str) -> bool:
@@ -556,6 +638,9 @@ class Index:
     filtered_sql_fixtures: dict | None = None
     parser_comment_free: set[int] | None = None
     direct_fixture_readers: dict | None = None
+    function_scopes: dict | None = None
+    inherited_dialect_tests: dict | None = None
+    redundant_import_sites: dict | None = None
 
     @classmethod
     def load(cls, path: Path, ids: dict[str, int], sha: str) -> Index | None:
@@ -570,7 +655,8 @@ class Index:
                        data.get("multiline_literals"), data.get("expression_flag_sites"),
                        data.get("show_flag_sites"), data.get("isolated_test_methods"),
                        data.get("filtered_sql_fixtures"), set(data.get("parser_comment_free", ())),
-                       data.get("direct_fixture_readers"))
+                       data.get("direct_fixture_readers"), data.get("function_scopes"),
+                       data.get("inherited_dialect_tests"), data.get("redundant_import_sites"))
         except (OSError, EOFError, ValueError, KeyError, TypeError):
             return None
 
@@ -667,4 +753,9 @@ class Index:
                 # An unobserved evaluation site stays in the broader fallback.
                 if all(observations):
                     return set().union(*observations)
+        scopes = (self.function_scopes or {}).get(path)
+        if scopes:
+            bodies = changed_function_bodies(source, output)
+            if bodies and all(line in scopes for line in bodies):
+                return {test for line in bodies for test in scopes[line]}
         return None

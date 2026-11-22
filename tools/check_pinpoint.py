@@ -6,7 +6,10 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pinpoint import Index, _predicate_entry, classify_line, local_effect_lines, table_comment_operations_only
+from pinpoint import (
+    Index, _predicate_entry, changed_function_bodies, classify_line, local_effect_lines,
+    table_comment_operations_only,
+)
 from selector import parse_unified_diff
 
 
@@ -55,6 +58,9 @@ def check():
     assert local_effect_lines(original, edited.replace("return result * 2", "return (y := result)")) is None
     assert local_effect_lines(original, edited.replace("def f(x):", "def f(x=1):")) is None
     assert local_effect_lines(original, edited.replace("result = (", "self.result = (")) is None
+    assert changed_function_bodies(original, edited) == [1]
+    assert changed_function_bodies(original, edited.replace("return result * 2", "yield result")) is None
+    assert changed_function_bodies(original, edited.replace("def f(x):", "def f(x=0):")) is None
 
     original = '''class Parser:
     def _parse_table_parts_fast(self):

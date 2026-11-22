@@ -1,6 +1,7 @@
 """Record pinned SQLGlot modules loaded by each test file in a fresh process."""
 
 from concurrent.futures import ThreadPoolExecutor
+import gzip
 import json
 import os
 from pathlib import Path
@@ -13,9 +14,25 @@ BASE = ROOT / "vendor/sqlglot"
 PINNED = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 PROBE = """
 import importlib, json, pathlib, sys
+from collections import defaultdict
 path = pathlib.PurePosixPath(sys.argv[1])
-importlib.import_module(".".join(path.with_suffix("").parts))
 root = pathlib.Path.cwd()
+prefix = (root / 'sqlglot').as_posix() + '/'
+lines = defaultdict(set)
+monitor = sys.monitoring
+tool = monitor.COVERAGE_ID
+
+def on_line(code, number):
+    source = code.co_filename.replace(chr(92), '/')
+    if source.startswith(prefix):
+        lines['sqlglot/' + source.removeprefix(prefix)].add(number)
+    return monitor.DISABLE
+
+monitor.use_tool_id(tool, 'projektblade-cold')
+monitor.register_callback(tool, monitor.events.LINE, on_line)
+monitor.set_events(tool, monitor.events.LINE)
+importlib.import_module(".".join(path.with_suffix("").parts))
+monitor.set_events(tool, 0)
 seen = []
 for name, mod in sorted(sys.modules.items()):
     path = getattr(mod, "__file__", None)
@@ -23,7 +40,7 @@ for name, mod in sorted(sys.modules.items()):
         target = pathlib.Path(path).resolve()
         if target.is_relative_to(root):
             seen.append(target.relative_to(root).as_posix())
-print("BLADE_IMPORTS:" + json.dumps(seen))
+print("BLADE_IMPORTS:" + json.dumps([seen, {path: sorted(hits) for path, hits in lines.items()}]))
 """
 
 
@@ -59,11 +76,15 @@ def main():
         captured = dict(pool.map(capture, paths))
     payload = {
         "pinned_sha": PINNED, "test_ids": [test["id"] for test in tests],
-        "python": list(sys.version_info[:2]), "platform": sys.platform, "imports": captured,
+        "python": list(sys.version_info[:2]), "platform": sys.platform,
     }
     (ROOT / "maps/cold-imports.json").write_text(
-        json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8"
+        json.dumps({**payload, "imports": {path: value[0] if value else None for path, value in captured.items()}},
+                   separators=(",", ":")) + "\n", encoding="utf-8"
     )
+    profiles = {path: value[1] if value else None for path, value in captured.items()}
+    raw = json.dumps({**payload, "lines": profiles}, separators=(",", ":")).encode()
+    (ROOT / "maps/cold-lines.json.gz").write_bytes(gzip.compress(raw, mtime=0))
     print(f"Recorded {sum(v is not None for v in captured.values())}/{len(paths)} test files.")
     print("Unobserved:", [p for p, v in captured.items() if v is None])
 

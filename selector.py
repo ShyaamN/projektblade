@@ -506,6 +506,7 @@ def select(
             return result
 
     selected_files: set[str] = set()
+    inherited_tests: set[int] = set()
 
     def add_files(files: set[str], reason: str) -> None:
         if "static" not in use:
@@ -695,6 +696,8 @@ def select(
                     selected_files.add(f"tests/dialects/test_{dialect}.py")
             elif class_body and dialect and dialect in impact.dialect_names:
                 files = {f"tests/dialects/test_{dialect}.py"}
+                if pinpoint is not None and pinpoint.inherited_dialect_tests:
+                    inherited_tests.update(pinpoint.inherited_dialect_tests.get(path, ()))
                 # Nested Tokenizer/Parser/Generator class attrs rarely need the
                 # full optimizer suite; top-level Dialect attrs often do.
                 if nested_tooling:
@@ -791,6 +794,7 @@ def select(
             if nums:
                 result.numbers.update(nums)
         if routed is None:
+            result.numbers.update(inherited_tests)
             return result
     else:
         # Preserve other static evidence where it fits the existing schedule.
@@ -803,6 +807,7 @@ def select(
         result.reasons.append(f"pool_route_id_mismatch:{len(missing)}")
         result.numbers = set(all_numbers)
         return result
+    result.numbers.update(inherited_tests)
     result.numbers.update(id_to_number[test_id] for test_id in routed)
     result.reasons.append(f"pool_routes:{len(routed)}")
     return result

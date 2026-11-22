@@ -255,6 +255,146 @@ def direct_json_fixtures(base, coverage):
     return verified
 
 
+def cold_line_postings(maps, coverage):
+    with gzip.open(maps / "cold-lines.json.gz", "rt", encoding="utf-8") as stream:
+        cold = json.load(stream)
+    if cold["pinned_sha"] != PINNED or cold["test_ids"] != coverage["test_ids"]:
+        raise RuntimeError("Cold line inventory mismatch")
+    by_file = defaultdict(set)
+    for i, node in enumerate(coverage["test_ids"]):
+        by_file[node.split("::", 1)[0]].add(i)
+    if by_file.keys() != cold["lines"].keys() or any(files is None for files in cold["lines"].values()):
+        raise RuntimeError("Cold line collection is incomplete")
+    eager_lines = defaultdict(lambda: defaultdict(set))
+    for test_file, paths in cold["lines"].items():
+        for path, hits in paths.items():
+            for line in hits:
+                eager_lines[path][line].update(by_file[test_file])
+    return eager_lines
+
+
+def function_scope_postings(trees, coverage, eager_lines):
+    result = {}
+    for path, tree in trees.items():
+        warm = coverage["files"].get(path, {})
+        cold = eager_lines.get(path, {})
+        postings = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            hits = set()
+            for line in range(node.body[0].lineno, node.end_lineno + 1):
+                hits.update(warm.get(str(line), ()))
+                hits.update(cold.get(line, ()))
+            if hits:
+                postings[node.lineno] = sorted(hits)
+        if postings:
+            result[path] = postings
+    return result
+
+
+def inherited_dialect_tests(trees, coverage):
+    roots = {"dialects", "generators", "parsers"}
+    modules = {path[:-3].replace("/", "."): path for path in trees if path.split("/")[1] in roots}
+    classes = {f"{module}.{cls.name}": path for module, path in modules.items()
+               for cls in trees[path].body if isinstance(cls, ast.ClassDef)}
+    descendants = defaultdict(set)
+    for module, path in modules.items():
+        aliases = {}
+        for stmt in trees[path].body:
+            if isinstance(stmt, ast.ImportFrom) and stmt.module and stmt.level == 0:
+                aliases.update((item.asname or item.name, f"{stmt.module}.{item.name}") for item in stmt.names)
+            elif isinstance(stmt, ast.Import):
+                aliases.update((item.asname or item.name.split(".")[0],
+                                item.name if item.asname else item.name.split(".")[0]) for item in stmt.names)
+        for cls in trees[path].body:
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            for base in cls.bases:
+                name = ast.unparse(base)
+                head, *suffix = name.split(".")
+                target = ".".join((aliases.get(head, head if suffix else f"{module}.{head}"), *suffix))
+                parent = classes.get(target)
+                if parent and parent != path:
+                    descendants[parent].add(path)
+
+    tests = defaultdict(list)
+    for i, node in enumerate(coverage["test_ids"]):
+        tests[node.split("::", 1)[0]].append(i)
+    result = {}
+    for path, children in descendants.items():
+        pending, visited = list(children), {path}
+        while pending:
+            child = pending.pop()
+            if child in visited:
+                continue
+            visited.add(child)
+            pending.extend(descendants.get(child, ()))
+        own = Path(path).stem
+        names = {Path(child).stem for child in visited} - {own}
+        mandatory = {i for name in names for i in tests[f"tests/dialects/test_{name}.py"]}
+        if mandatory:
+            result[path] = sorted(mandatory | set(tests[f"tests/dialects/test_{own}.py"]))
+    return result
+
+
+def redundant_import_sites(trees):
+    """Record top-level imports whose provider is already loaded."""
+    modules = {path[:-3].replace("/", ".").removesuffix(".__init__"): path for path in trees}
+
+    def providers(stmt):
+        if isinstance(stmt, ast.Import):
+            return {alias.name for alias in stmt.names}
+        if isinstance(stmt, ast.ImportFrom) and stmt.level == 0 and stmt.module != "__future__":
+            return {stmt.module, *(f"{stmt.module}.{alias.name}" for alias in stmt.names
+                                   if f"{stmt.module}.{alias.name}" in modules)}
+        return set()
+
+    def direct_imports(module):
+        if module not in modules:
+            return set()
+        return {target for stmt in trees[modules[module]].body for target in providers(stmt)}
+
+    direct = {module: direct_imports(module) for module in modules}
+
+    def paths_from(starts, current):
+        paths = {}
+        queue = [(module, ()) for module in sorted(starts)]
+        for module, parents in queue:
+            if module in paths:
+                continue
+            paths[module] = (*parents, module)
+            queue.extend((child, paths[module]) for child in sorted(direct.get(module, ())))
+        return paths if current not in paths else {}
+
+    referenced = defaultdict(set)
+    for tree in trees.values():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module in modules:
+                referenced[node.module].update(a.name for a in node.names)
+    result = {}
+    for module, path in modules.items():
+        if not path.startswith(("sqlglot/parsers/", "sqlglot/generators/", "sqlglot/dialects/")):
+            continue
+        prior = {target: (None, sorted(modules[name] for name in chain if name in modules))
+                 for target, chain in paths_from({"sqlglot"}, module).items()}
+        safe = {}
+        for stmt in trees[path].body:
+            provided = providers(stmt)
+            if not provided:
+                continue
+            literal = ast.dump(stmt)
+            names = {a.asname or a.name.split(".")[0] for a in stmt.names}
+            if provided <= prior.keys() and "*" not in names and not names & referenced[module] and "*" not in referenced[module]:
+                safe[literal] = (sorted(names), [prior[item] for item in sorted(provided)])
+            for target, chain in paths_from(provided, module).items():
+                proof = (literal, sorted(modules[name] for name in chain if name in modules))
+                prior.setdefault(target, proof)
+        if safe:
+            result[path] = safe
+    return result
+
+
 def main():
     base = ROOT / "vendor/sqlglot"
     head = subprocess.check_output(["git", "-C", str(base), "rev-parse", "HEAD"], text=True).strip()
@@ -288,6 +428,7 @@ def main():
     operator_lines = {}
     multiline_literals = {}
     trees = {path: ast.parse(source) for path, source in sources.items()}
+    eager_lines = cold_line_postings(maps, coverage)
     for path, tree in trees.items():
         keep = {
             str(node.test.lineno if isinstance(node, ast.If) else node.lineno)
@@ -299,10 +440,14 @@ def main():
                 entry = getattr(node, "test", None) or getattr(node, "iter", None) or getattr(node, "value", None)
                 if entry is not None:
                     keep.update((str(node.lineno), str(entry.lineno)))
-        lines[path] = {
-            line: base64.b64encode(struct.pack(f"<{len(hits)}H", *hits)).decode()
-            for line, hits in coverage["files"].get(path, {}).items() if line in keep
-        }
+        warm = coverage["files"].get(path, {})
+        cold = eager_lines.get(path, {})
+        postings = {}
+        for line in sorted(keep, key=int):
+            hits = sorted(set(warm.get(line, ())) | set(cold.get(int(line), ())))
+            if hits:
+                postings[line] = base64.b64encode(struct.pack(f"<{len(hits)}H", *hits)).decode()
+        lines[path] = postings
         checked = sorted({
             node.lineno for node in ast.walk(tree)
             if isinstance(node, ast.Compare) and isinstance(node.left, ast.Attribute)
@@ -347,6 +492,9 @@ def main():
         "show_flag_sites": show_flag_sites(maps, coverage, trees),
         "isolated_test_methods": isolated_test_methods(base, coverage["test_ids"]),
         "direct_fixture_readers": direct_json_fixtures(base, coverage),
+        "function_scopes": function_scope_postings(trees, coverage, eager_lines),
+        "inherited_dialect_tests": inherited_dialect_tests(trees, coverage),
+        "redundant_import_sites": redundant_import_sites(trees),
         # The pinned SQL fixture readers in tests/helpers.py both remove
         # column-zero '--' lines and empty lines before parsing the file.
         "filtered_sql_fixtures": {
