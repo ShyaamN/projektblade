@@ -1,0 +1,9 @@
+**
+!Dockerfile
+!selector.py
+!pinpoint.py
+!maps/
+maps/*
+!maps/impact.json
+!maps/coverage.json.gz
+!maps/pinpoint.marshal.gz

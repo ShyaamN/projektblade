@@ -13,22 +13,27 @@ The image reads `/data/tests.json` and `/data/commits/<id>.patch`. It writes one
 ## Layout
 
 - `selector.py` reads the pinned coverage and import maps and prints the schedule.
-- `maps/impact.json` and `maps/coverage.json.gz` are built from that pinned checkout.
+- The Docker image uses `maps/impact.json`, `maps/coverage.json.gz`, and `maps/pinpoint.marshal.gz` from the pinned checkout.
 - `Dockerfile` runs the selector as `nobody`.
 - `score.py` checks a local stdout file. The arithmetic is in `SCORING.md`.
 
+## Submission
+
+Use the public repository URL `https://github.com/ShyaamN/projektblade` in the repository field and the full 40-character Git SHA in the Commit field. Push the revision to GitHub first. A blank Commit field selects the latest commit on the repository's default branch. The scorer builds the Dockerfile at the repository root and supplies its own `/data` at runtime.
+
 ## Local check
 
-Python 3.9 or newer. From this directory:
+With Python 3.13 or newer, run from this directory:
 
 ```sh
 python tools/run_score.py
 ```
 
-Docker, when you want the same limits as a container run:
+With Docker, build from the repository root and benchmark under the contest limits:
 
 ```sh
 docker build --platform linux/amd64 --tag projektblade .
+python tools/bench_docker.py projektblade
 ```
 
 `sample/answers.json` is for that local check only. The selector never opens it.
