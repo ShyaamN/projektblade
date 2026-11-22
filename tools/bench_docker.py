@@ -16,6 +16,7 @@ from score import evaluate_run
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image")
+    parser.add_argument("--verify", choices=("0", "1"))
     args = parser.parse_args()
     sample = ROOT / "sample"
     tests = json.loads((sample / "tests.json").read_text(encoding="utf-8"))["tests"]
@@ -26,11 +27,13 @@ def main():
         'r=[resource.getrusage(who) for who in (resource.RUSAGE_SELF,resource.RUSAGE_CHILDREN)];'
         'print("MEASURED_CPU",sum(q.ru_utime+q.ru_stime for q in r),file=sys.stderr)'
     )
+    verifier_env = [] if args.verify is None else ["--env", f"BLADE_VERIFY={args.verify}"]
     command = [
         "docker", "run", "--rm", "--platform", "linux/amd64", "--network", "none",
         "--cpus", "2", "--memory", "4096m", "--memory-swap", "4096m", "--pids-limit", "256",
         "--read-only", "--tmpfs", "/tmp:rw,size=64m,mode=1777", "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges", "--user", "65534:65534", "--env", "HOME=/tmp",
+        *verifier_env,
         "--mount", f"type=bind,source={sample / 'commits'},target=/data/commits,readonly",
         "--mount", f"type=bind,source={sample / 'tests.json'},target=/data/tests.json,readonly",
         "--entrypoint", "python", args.image, "-c", launcher,

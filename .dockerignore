@@ -2,6 +2,8 @@
 !Dockerfile
 !selector.py
 !pinpoint.py
+!verify.py
+!requirements.lock
 !maps/
 maps/*
 !maps/impact.json

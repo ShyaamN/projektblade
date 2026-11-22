@@ -11,6 +11,7 @@ import ast
 import gzip
 import json
 import math
+import os
 import re
 import struct
 import sys
@@ -1060,6 +1061,17 @@ def _pool_route_ids(changes: list[FileChange], impact: ImpactMaps) -> set[str] |
     return picked
 
 
+def _verification_eligible(numbers: set[int], by_number: dict[int, dict]) -> bool:
+    # Amortize pytest startup across a small group of cheap tests.
+    if not 2 <= len(numbers) <= 6:
+        return False
+    for number in numbers:
+        test = by_number.get(number)
+        if test is None or test["seconds"] > 0.5:
+            return False
+    return True
+
+
 def main() -> None:
     tests_raw = json.loads((DATA / "tests.json").read_text(encoding="utf-8"))["tests"]
     tests = [
@@ -1104,6 +1116,12 @@ def main() -> None:
     )
     full_schedule = schedule(tests)
     commits = sorted((DATA / "commits").glob("*.patch"))
+    verifier = None
+    sqlglot_root = Path("/opt/sqlglot")
+    if os.environ.get("BLADE_VERIFY") != "0" and sys.platform == "linux" and sqlglot_root.is_dir():
+        from verify import Verifier
+
+        verifier = Verifier(sqlglot_root)
     total = 0
     for patch_path in commits:
         patch = patch_path.read_text(encoding="utf-8", errors="replace")
@@ -1119,6 +1137,27 @@ def main() -> None:
         else:
             selection.numbers.difference_update(selection.excluded)
             selection.slack_candidates.difference_update(selection.excluded)
+            if (
+                verifier is not None
+                and _verification_eligible(selection.numbers, by_number)
+            ):
+                ordered = [by_number[number] for number in sorted(selection.numbers)]
+                # With up to six half-second tests, one worker is cheapest.
+                passed = verifier.passes(
+                    patch,
+                    [test["id"] for test in ordered],
+                    2 + sum(test["ms"] for test in ordered) / 1000,
+                )
+                if passed:
+                    drop = {test["number"] for test in ordered if test["id"] in passed}
+                    selection.numbers.difference_update(drop)
+                    selection.slack_candidates.difference_update(drop)
+                    print(
+                        f"{patch_path.stem}: verify passed={len(passed)} "
+                        f"{len(selection.numbers)} tests remaining",
+                        file=sys.stderr,
+                        flush=True,
+                    )
             selected = [by_number[n] for n in sorted(selection.numbers) if n in by_number]
             workers = schedule(selected)
             retain_within_slack(workers, selection.slack_candidates, by_number)
