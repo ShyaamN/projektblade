@@ -84,6 +84,14 @@ def main() -> int:
     quoted = 'diff --git "a/sqlglot/a b.py" "b/sqlglot/a b.py"\n'
     assert choose(import_patch + quoted, loaded).force_all
 
+    fixture = "tests/fixtures/identity.sql"
+    header_like = patch_for(fixture, "-- a/another-file\nSELECT 1;\n", "++ b/another-file\nSELECT 1;\n")
+    fixture_change, = selector.parse_unified_diff(header_like)
+    assert fixture_change.old_path == fixture_change.new_path == fixture
+    assert fixture_change.removed_bodies == ["-- a/another-file"]
+    assert fixture_change.added_bodies == ["++ b/another-file"]
+    assert selector.parse_unified_diff(header_like.rsplit("\n", 2)[0]) is None
+
     test_path = "tests/test_parser.py"
     test_source = zlib.decompress(pinpoint.test_sources[test_path]).decode("utf-8")
     method = next(

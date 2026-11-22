@@ -102,8 +102,32 @@ def parse_unified_diff(patch: str) -> list[FileChange] | None:
     changes: list[FileChange] = []
     current: FileChange | None = None
     old_line = 0
-    new_line = 0
+    old_left = new_left = 0
     for line in patch.splitlines():
+        if old_left or new_left:
+            if line.startswith("\\ No newline at end of file"):
+                continue
+            prefix, body = line[:1], line[1:]
+            if prefix not in {" ", "+", "-"} or current is None:
+                return None
+            if prefix != "+" and old_left == 0 or prefix != "-" and new_left == 0:
+                return None
+            if prefix == " ":
+                current.context_lines.add(old_line)
+            else:
+                if prefix == "+":
+                    current.added_bodies.append(body)
+                else:
+                    current.removed_bodies.append(body)
+                    current.old_lines.add(old_line)
+                if body.lstrip().startswith(("import ", "from ", "class ", "def ", "@")):
+                    current.structural = True
+            if prefix != "+":
+                old_line += 1
+                old_left -= 1
+            if prefix != "-":
+                new_left -= 1
+            continue
         m = DIFF_FILE_RE.match(line)
         if m:
             old_p, new_p = m.group(1), m.group(2)
@@ -133,32 +157,9 @@ def parse_unified_diff(patch: str) -> list[FileChange] | None:
         hm = HUNK_RE.match(line)
         if hm:
             old_line = int(hm.group(1))
-            new_line = int(hm.group(3))
-            continue
-        if line.startswith("\\"):
-            continue
-        if line.startswith("+"):
-            if line.startswith("+++"):
-                continue
-            body = line[1:]
-            current.added_bodies.append(body)
-            if body.lstrip().startswith(("import ", "from ", "class ", "def ", "@")):
-                current.structural = True
-            new_line += 1
-        elif line.startswith("-"):
-            if line.startswith("---"):
-                continue
-            body = line[1:]
-            current.removed_bodies.append(body)
-            current.old_lines.add(old_line)
-            if body.lstrip().startswith(("import ", "from ", "class ", "def ", "@")):
-                current.structural = True
-            old_line += 1
-        elif line.startswith(" "):
-            current.context_lines.add(old_line)
-            old_line += 1
-            new_line += 1
-    return changes
+            old_left = int(hm.group(2) or "1")
+            new_left = int(hm.group(4) or "1")
+    return None if old_left or new_left else changes
 
 
 def unresolved_path(
@@ -432,13 +433,19 @@ def select(
 
     validated: dict[str, str] = {}
     import_changes: set[str] = set()
+    test_changes: dict[str, set[int]] = {}
     if pinpoint is not None:
         # Reconstruct and compile before any empty or narrowed selection.
-        reason = python_risk(patch, changes, pinpoint, validated, import_changes)
+        reason = python_risk(patch, changes, pinpoint, validated, import_changes, test_changes)
         if reason:
             result.force_all = True
             result.reasons.append(reason)
             result.numbers = set(all_numbers)
+            return result
+        if test_changes:
+            path, = test_changes
+            result.numbers.update(test_changes[path])
+            result.reasons.append(f"isolated_test_body:{path}")
             return result
         if import_changes:
             for path in sorted(import_changes):
@@ -549,6 +556,9 @@ def select(
                 break
 
             if path.startswith("tests/fixtures/") and path.endswith(".sql"):
+                if pinpoint is not None and pinpoint.fixture_equivalent(patch, change):
+                    result.reasons.append(f"filtered_sql_trivia:{path}")
+                    continue
                 rel = path[len("tests/fixtures/") :]
                 stem = rel[: -len(".sql")]
                 base = Path(stem).name

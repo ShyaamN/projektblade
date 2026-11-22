@@ -43,6 +43,14 @@ CASES = (
      '"CREATE TABLE": _show_parser("CREATE TABLE", target=True),',
      '"CREATE TABLE": _show_parser("CREATE TABLE", target=False),',
      "tests/dialects/test_mysql.py::TestMySQL::test_show_create_qualified", "FAILED"),
+    ("isolated_test_assertion", "tests/test_parser.py",
+     '        self.assertEqual(expr.sql(dialect="clickhouse"), single_union)\n',
+     '        self.assertEqual(expr.sql(dialect="clickhouse"), single_union)\n'
+     '        assert False, "projektblade holdout assertion"\n',
+     "tests/test_parser.py::TestParser::test_union", "projektblade holdout assertion"),
+    ("filtered_fixture_trivia", "tests/fixtures/optimizer/annotate_types.sql",
+     "# dialect: spark", "-- project note, filtered by the fixture reader\n# dialect: spark",
+     "tests/test_optimizer.py::TestOptimizer::test_annotate_types", None),
 )
 
 
@@ -112,15 +120,20 @@ def main():
             finally:
                 target.write_bytes(original)
             report = broken.stdout + broken.stderr
-            assert broken.returncode and expected in report, report
             number = by_id[node]
             scheduled = lambda groups: number in {n for group in groups for n in group}
             cost = lambda groups: (max((sum(ms[n] for n in w) for w in groups), default=0)
                                    + 2000 * len(groups)) / 1000
-            print(f"{key}: pass -> fail; previous inclusion={scheduled(before[key])}, "
+            if expected is None:
+                assert broken.returncode == 0 and not after[key], report
+                outcome = "pass -> pass"
+            else:
+                assert broken.returncode and expected in report, report
+                assert scheduled(after[key]), f"Omitted failing test: {node}"
+                outcome = "pass -> fail"
+            print(f"{key}: {outcome}; previous inclusion={scheduled(before[key])}, "
                   f"current inclusion={scheduled(after[key])}; "
                   f"schedule {cost(before[key]):.3f}s -> {cost(after[key]):.3f}s", flush=True)
-            assert scheduled(after[key]), f"Omitted failing test: {node}"
 
 
 if __name__ == "__main__":

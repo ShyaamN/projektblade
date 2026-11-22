@@ -90,19 +90,47 @@ def _patched_source(path: str, source: str, patch: str) -> str | None:
     return "\n".join([*output, *lines[cursor:]]) + "\n"
 
 
-def _only_test_bodies_changed(before: str, after: str) -> bool:
+def _terminal_assertion_change(old: list[ast.stmt], new: list[ast.stmt]) -> bool:
+    if len(new) == len(old) + 1 and _same(old, new[:-1]):
+        last = new[-1]
+        return (isinstance(last, ast.Assert) and isinstance(last.test, ast.Constant)
+                and type(last.test.value) is bool
+                and (last.msg is None or isinstance(last.msg, ast.Constant)))
+    if not old or len(new) != len(old) or not _same(old[:-1], new[:-1]):
+        return False
+    calls = [stmt.value for stmt in (old[-1], new[-1]) if isinstance(stmt, ast.Expr)]
+    if len(calls) != 2 or not all(
+        isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name) and call.func.value.id == "self"
+        and call.func.attr in {"assertEqual", "assertNotEqual", "assertIs", "assertIsNot"}
+        and len(call.args) == 2 and not call.keywords and isinstance(call.args[1], ast.Constant)
+        for call in calls
+    ):
+        return False
+    return _same(calls[0].func, calls[1].func) and _same(calls[0].args[0], calls[1].args[0])
+
+
+def _test_body_changes(before: str, after: str) -> tuple[set[str], bool] | None:
     trees = [_ast(before), _ast(after)]
-    for tree in trees:
-        scopes = list(tree.body)
+    bodies = [{}, {}]
+    for tree, functions in zip(trees, bodies):
+        scopes = [(node, ()) for node in tree.body]
         while scopes:
-            node = scopes.pop()
+            node, scope = scopes.pop()
             if isinstance(node, ast.ClassDef):
-                scopes.extend(node.body)
+                scopes.extend((stmt, (*scope, node.name)) for stmt in node.body)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
                 if node.decorator_list:
                     continue
+                name = "::".join((*scope, node.name))
+                if name in functions:
+                    return None
+                functions[name] = node.body
                 node.body = []
-    return _same(*trees)
+    if not _same(*trees) or bodies[0].keys() != bodies[1].keys():
+        return None
+    changed = {name for name in bodies[0] if not _same(bodies[0][name], bodies[1][name])}
+    return changed, all(_terminal_assertion_change(bodies[0][name], bodies[1][name]) for name in changed)
 
 
 def _import_time_operations(source: str) -> list[str]:
@@ -134,6 +162,7 @@ def _literal_edit(change, original, output, ranges) -> bool:
 
 def python_risk(
     patch: str, changes, index: Index, validated: dict[str, str], import_changes: set[str],
+    test_changes: dict[str, set[int]],
 ) -> str | None:
     """Full-suite reason when a Python edit cannot be reconstructed and compiled.
 
@@ -165,8 +194,14 @@ def python_risk(
             )
             if not same_operator:
                 compile(output, old, "exec", dont_inherit=True)
-            if old.startswith("tests/") and not _only_test_bodies_changed(original, output):
-                return "python_test_collection"
+            if old.startswith("tests/"):
+                body_changes = _test_body_changes(original, output)
+                if body_changes is None:
+                    return "python_test_collection"
+                changed_methods, terminal_only = body_changes
+                isolated = (index.isolated_test_methods or {}).get(old, {})
+                if len(changes) == 1 and terminal_only and changed_methods and changed_methods <= isolated.keys():
+                    test_changes[old] = {n for name in changed_methods for n in isolated[name]}
             if old.startswith("sqlglot/"):
                 if old.endswith("/__init__.py") and not _same(_ast(original), _ast(output)):
                     return "python_package_init"
@@ -395,6 +430,8 @@ class Index:
     multiline_literals: dict | None = None
     expression_flag_sites: dict | None = None
     show_flag_sites: dict | None = None
+    isolated_test_methods: dict | None = None
+    filtered_sql_fixtures: dict | None = None
 
     @classmethod
     def load(cls, path: Path, ids: dict[str, int], sha: str) -> Index | None:
@@ -407,7 +444,8 @@ class Index:
                        data.get("tokenizer"), data.get("primary"), data.get("operator_lines"),
                        data.get("test_sources"), data.get("import_test_files"),
                        data.get("multiline_literals"), data.get("expression_flag_sites"),
-                       data.get("show_flag_sites"))
+                       data.get("show_flag_sites"), data.get("isolated_test_methods"),
+                       data.get("filtered_sql_fixtures"))
         except (OSError, EOFError, ValueError, KeyError, TypeError):
             return None
 
@@ -416,6 +454,23 @@ class Index:
         if posting is None:
             return set()
         return {n for n, in struct.iter_unpack("<H", base64.b64decode(posting))}
+
+    def fixture_equivalent(self, patch: str, change) -> bool:
+        path = change.old_path
+        if path != change.new_path:
+            return False
+        source = (self.filtered_sql_fixtures or {}).get(path)
+        bodies = change.added_bodies + change.removed_bodies
+        if source is None or not all(not line or line.startswith("--") for line in bodies):
+            return False
+        original = zlib.decompress(source).decode("utf-8")
+        updated = _patched_source(path, original, patch)
+        if updated is None:
+            return False
+        def visible(text):
+            return [line for line in text.splitlines() if line and not line.startswith("--")]
+
+        return visible(original) == visible(updated)
 
     def narrow(self, patch, change, *, allow_equivalence: bool = True,
                validated: dict[str, str] | None = None) -> set[int] | None:

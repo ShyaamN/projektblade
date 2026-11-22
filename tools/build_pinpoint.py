@@ -163,6 +163,44 @@ def show_flag_sites(maps, coverage, trees):
     return dict(sites)
 
 
+def isolated_test_methods(base, nodes):
+    """Index test bodies with no direct callers or known inheriting classes."""
+    referenced = set()
+    inherited = set()
+    for source in (base / "tests").rglob("*.py"):
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                referenced.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                referenced.add(node.attr)
+            elif isinstance(node, ast.alias):
+                referenced.add(node.name)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if node.value.startswith("test_"):
+                    referenced.add(node.value)
+            elif isinstance(node, ast.ClassDef):
+                for parent in node.bases:
+                    for name in ast.walk(parent):
+                        if isinstance(name, ast.Name):
+                            inherited.add(name.id)
+                        elif isinstance(name, ast.Attribute):
+                            inherited.add(name.attr)
+    methods = defaultdict(dict)
+    files_by_name = defaultdict(set)
+    for i, node in enumerate(nodes):
+        path, *parts = node.split("::")
+        if not 1 <= len(parts) <= 2:
+            continue
+        parts[-1] = parts[-1].split("[", 1)[0]
+        name = "::".join(parts)
+        files_by_name[name].add(path)
+        if parts[-1] not in referenced and (len(parts) == 1 or parts[0] not in inherited):
+            methods[path].setdefault(name, []).append(i)
+    return {path: {name: ids for name, ids in names.items() if len(files_by_name[name]) == 1}
+            for path, names in methods.items()}
+
+
 def main():
     base = ROOT / "vendor/sqlglot"
     head = subprocess.check_output(["git", "-C", str(base), "rev-parse", "HEAD"], text=True).strip()
@@ -248,6 +286,13 @@ def main():
         "multiline_literals": multiline_literals,
         "expression_flag_sites": expression_flag_sites(base, maps, trees, coverage),
         "show_flag_sites": show_flag_sites(maps, coverage, trees),
+        "isolated_test_methods": isolated_test_methods(base, coverage["test_ids"]),
+        # The pinned SQL fixture readers in tests/helpers.py both remove
+        # column-zero '--' lines and empty lines before parsing the file.
+        "filtered_sql_fixtures": {
+            path.relative_to(base).as_posix(): zlib.compress(path.read_bytes())
+            for path in sorted((base / "tests/fixtures").rglob("*.sql"))
+        },
         "test_sources": {
             path: zlib.compress((base / path).read_text(encoding="utf-8").encode())
             for path in sorted({node.split("::", 1)[0] for node in coverage["test_ids"]})
