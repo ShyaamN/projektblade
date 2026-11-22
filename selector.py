@@ -514,7 +514,13 @@ def select(
         selected_files.update(files)
         result.reasons.append(reason)
 
+    direct_fixtures = (pinpoint.direct_fixture_readers or {}) if pinpoint is not None else {}
     for change in changes:
+        path = change.old_path
+        if path == change.new_path and path in direct_fixtures:
+            result.numbers.update(direct_fixtures[path])
+            result.reasons.append(f"direct_fixture:{path}")
+            continue
         paths = {p for p in (change.old_path, change.new_path) if p}
         if not paths:
             result.force_all = True

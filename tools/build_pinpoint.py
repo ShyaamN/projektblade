@@ -215,6 +215,46 @@ def merge_stress_lines(maps, coverage):
                 postings[key] = sorted({*postings.get(key, ()), ids[node]})
 
 
+def direct_json_fixtures(base, coverage):
+    """Verify literal FIXTURES_DIR reads before packaging their exact postings."""
+    candidates = {path: hits[0] for path, hits in coverage["fixtures"].items()
+                  if path.endswith(".json") and len(hits) == 1}
+    basenames = {Path(path).name for path in candidates}
+    references = defaultdict(list)
+    for root in (base / "tests", base / "sqlglot"):
+        for source in root.rglob("*.py"):
+            text = source.read_text(encoding="utf-8")
+            if not any(name in text for name in basenames):
+                continue
+            tree = ast.parse(text)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in basenames:
+                    references[node.value].append((source.relative_to(base).as_posix(), tree, node))
+
+    verified = {}
+    for path, number in candidates.items():
+        parts = path.split("/")
+        postings = references[parts[-1]]
+        filename, *scope = coverage["test_ids"][number].split("::")
+        if len(postings) != 1 or len(scope) != 2 or postings[0][0] != filename:
+            continue
+        _, tree, literal = postings[0]
+        for cls in tree.body:
+            if not isinstance(cls, ast.ClassDef) or cls.name != scope[0]:
+                continue
+            for method in cls.body:
+                if not isinstance(method, ast.FunctionDef) or method.name != scope[1] or method.decorator_list:
+                    continue
+                target = ast.parse("open(os.path.join(FIXTURES_DIR, " + ", ".join(map(repr, parts)) + "))",
+                                   mode="eval").body
+                for call in ast.walk(method):
+                    if (isinstance(call, ast.Call) and literal in ast.walk(call) and call.args
+                            and ast.dump(call.func) == ast.dump(target.func)
+                            and ast.dump(call.args[0]) == ast.dump(target.args[0])):
+                        verified[f"tests/fixtures/{path}"] = [number]
+    return verified
+
+
 def main():
     base = ROOT / "vendor/sqlglot"
     head = subprocess.check_output(["git", "-C", str(base), "rev-parse", "HEAD"], text=True).strip()
@@ -306,6 +346,7 @@ def main():
         "expression_flag_sites": expression_flag_sites(base, maps, trees, coverage),
         "show_flag_sites": show_flag_sites(maps, coverage, trees),
         "isolated_test_methods": isolated_test_methods(base, coverage["test_ids"]),
+        "direct_fixture_readers": direct_json_fixtures(base, coverage),
         # The pinned SQL fixture readers in tests/helpers.py both remove
         # column-zero '--' lines and empty lines before parsing the file.
         "filtered_sql_fixtures": {

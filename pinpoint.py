@@ -555,6 +555,7 @@ class Index:
     isolated_test_methods: dict | None = None
     filtered_sql_fixtures: dict | None = None
     parser_comment_free: set[int] | None = None
+    direct_fixture_readers: dict | None = None
 
     @classmethod
     def load(cls, path: Path, ids: dict[str, int], sha: str) -> Index | None:
@@ -568,7 +569,8 @@ class Index:
                        data.get("test_sources"), data.get("import_test_files"),
                        data.get("multiline_literals"), data.get("expression_flag_sites"),
                        data.get("show_flag_sites"), data.get("isolated_test_methods"),
-                       data.get("filtered_sql_fixtures"), set(data.get("parser_comment_free", ())))
+                       data.get("filtered_sql_fixtures"), set(data.get("parser_comment_free", ())),
+                       data.get("direct_fixture_readers"))
         except (OSError, EOFError, ValueError, KeyError, TypeError):
             return None
 

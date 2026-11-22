@@ -99,6 +99,15 @@ def main() -> int:
     assert fixture_change.added_bodies == ["++ b/another-file"]
     assert selector.parse_unified_diff(header_like.rsplit("\n", 2)[0]) is None
 
+    known_json = "tests/fixtures/jsonpath/cts.json"
+    unknown_json = "tests/fixtures/jsonpath/not_a_real_fixture.json"
+    known = patch_for(known_json, '{"fixture": 1}\n', '{"fixture": 2}\n')
+    reader = loaded[3]["tests/test_jsonpath.py::TestJsonpath::test_cts_file"]
+    assert choose(known, loaded).numbers == {reader}
+    assert choose(known.replace(known_json, unknown_json), loaded).force_all
+    renamed = known.replace(f"b/{known_json}", f"b/{unknown_json}")
+    assert choose(renamed, loaded).force_all
+
     test_path = "tests/test_parser.py"
     test_source = zlib.decompress(pinpoint.test_sources[test_path]).decode("utf-8")
     method = next(

@@ -63,6 +63,9 @@ CASES = (
      '        "referenced_table": False,',
      '        "referenced_table": projektblade_unavailable_flag,',
      "tests/dialects/test_duckdb.py::TestDuckDB::test_create_trigger", "projektblade_unavailable_flag"),
+    ("direct_json_fixture", "tests/fixtures/jsonpath/cts.json",
+     '"selector": "$",', '"selector": "$[",',
+     "tests/test_jsonpath.py::TestJsonpath::test_cts_file", "Cannot have empty segment"),
 )
 
 
