@@ -1,0 +1,1 @@
+{"pinned_sha":"eb11aec4be8cb2122afe713a4816662c3f0fb2fa","constructed":{"tests/dialects/test_athena.py::TestAthena::test_max_nodes":["Add","Column","ColumnDef","DataType","From","Identifier","Schema","Select","Table"],"tests/test_parser.py::TestParser::test_max_nodes":["Column","EQ","From","Identifier","Literal","Select","Table"]}}

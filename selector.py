@@ -112,6 +112,8 @@ def parse_unified_diff(patch: str) -> list[FileChange] | None:
             current = FileChange(old_path=old_p, new_path=new_p)
             changes.append(current)
             continue
+        if line.startswith("diff --git "):
+            return None
         if current is None:
             continue
         if line.startswith("--- "):
@@ -429,16 +431,31 @@ def select(
         return result
 
     validated: dict[str, str] = {}
+    import_changes: set[str] = set()
     if pinpoint is not None:
         # Reconstruct and compile before any empty or narrowed selection.
-        reason = python_risk(patch, changes, pinpoint, validated)
+        reason = python_risk(patch, changes, pinpoint, validated, import_changes)
         if reason:
             result.force_all = True
             result.reasons.append(reason)
             result.numbers = set(all_numbers)
             return result
+        if import_changes:
+            for path in sorted(import_changes):
+                for test_file in pinpoint.import_test_files[path]:
+                    result.numbers.update(file_to_numbers.get(test_file, ()))
+                result.reasons.append(f"python_import_operation:{path}")
+            # For shared imports, retain all tests rather than rely on small
+            # gaps in the observed files or environment-dependent imports.
+            if len(result.numbers) * 100 >= len(all_numbers) * 95:
+                result.force_all = True
+                result.numbers = set(all_numbers)
+                return result
+            changes = [change for change in changes if change.old_path not in import_changes]
+            if not changes:
+                return result
 
-    identity = [change for change in changes if _none_identity_edit(change)]
+    identity = [change for change in changes if _none_identity_edit(change)] if len(changes) == 1 else []
     if identity:
         result.reasons.append(f"none_identity:{len(identity)}")
         if len(identity) == len(changes):
@@ -504,7 +521,9 @@ def select(
 
         # Non-executable comment/blank-only edit: skip coverage selection, but
         # still apply static envelopes for optimizer/typing hubs.
-        if is_nonexecutable_edit(change) and not any(path in file_to_numbers for path in paths):
+        if is_nonexecutable_edit(change) and all(
+            path.startswith("sqlglot/") and path.endswith(".py") for path in paths
+        ):
             result.reasons.append(f"nonexec:{next(iter(paths))}")
             for path in paths:
                 if path.startswith("sqlglot/optimizer/"):
@@ -710,6 +729,13 @@ def select(
                     result.force_all = True
                     result.reasons.append(f"unknown_sqlglot_module:{path}")
                     break
+                elif pinpoint is not None and "static" in use:
+                    exposed = (pinpoint.import_test_files or {}).get(path)
+                    if not exposed:
+                        result.force_all = True
+                        result.reasons.append(f"unmapped_executable_edit:{path}")
+                        break
+                    add_files(set(exposed), f"static:import_exposure:{path}")
             elif dialect and kind == "parsers":
                 # Parser method edits: dialect suite + optimizer (not full
                 # parser/expressions files — those dominate cost).
@@ -735,12 +761,19 @@ def select(
             number = id_to_number.get(test_id)
             if number is not None and number not in seeds:
                 routed.discard(test_id)
-    if routed is None:
+    # The recursive reference selection still models the original pool
+    # envelope. Actual decisions can fall back when all refined seeds are empty.
+    if routed is None or (pinpoint is not None and not routed and not result.numbers):
         for path in selected_files:
             nums = file_to_numbers.get(path)
             if nums:
                 result.numbers.update(nums)
-        return result
+        if routed is None:
+            return result
+    else:
+        # Preserve other static evidence where it fits the existing schedule.
+        for path in selected_files:
+            result.slack_candidates.update(file_to_numbers.get(path, ()))
 
     missing = [test_id for test_id in routed if test_id not in id_to_number]
     if missing:

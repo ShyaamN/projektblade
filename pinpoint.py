@@ -25,6 +25,11 @@ _VERSION = re.compile(
     r"(?P<left>\bself\.dialect\.version\s+)(?P<op><=|>=|<|>)"
     r"(?P<right>\s+\(\d+,\s*\d+\))"
 )
+_EXPRESSION_FLAG = re.compile(r"(\s*['\"][^'\"]+['\"]:\s*)(True|False)(,\s*)")
+_SHOW_FLAG = re.compile(
+    r"(\s*['\"][A-Z0-9_ ]+['\"]:\s*_show_parser\(['\"][A-Z0-9_ ]+['\"],\s*target=)"
+    r"(True|False)(\),\s*)"
+)
 
 
 def unpack_lines(value: bytes) -> dict:
@@ -100,20 +105,36 @@ def _only_test_bodies_changed(before: str, after: str) -> bool:
     return _same(*trees)
 
 
-def _import_time_raises(source: str) -> list[str]:
+def _import_time_operations(source: str) -> list[str]:
     pending = [_ast(source)]
-    raises = []
+    operations = []
     while pending:
         node = pending.pop()
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
             continue
-        if isinstance(node, ast.Raise):
-            raises.append(ast.dump(node))
-        pending.extend(ast.iter_child_nodes(node))
-    return raises
+        if isinstance(node, (ast.Import, ast.ImportFrom, ast.Raise)):
+            operations.append(ast.dump(node))
+        pending.extend(reversed(list(ast.iter_child_nodes(node))))
+    return operations
 
 
-def python_risk(patch: str, changes, index: Index, validated: dict[str, str]) -> str | None:
+_IMPORT_OPERATION = re.compile(r"\s*(?:import|from|raise)\b")
+_COMMENT_OR_BLANK = re.compile(r"\s*(?:#.*)?\Z")
+
+
+def _literal_edit(change, original, output, ranges) -> bool:
+    lines = change.added_bodies + change.removed_bodies
+    if not ranges or not lines or not all(_COMMENT_OR_BLANK.fullmatch(line) for line in lines):
+        return False
+    anchors = change.old_lines | change.context_lines
+    if anchors and not any(lo <= n <= hi for lo, hi in ranges for n in anchors):
+        return False
+    return not _same(_ast(original), _ast(output))
+
+
+def python_risk(
+    patch: str, changes, index: Index, validated: dict[str, str], import_changes: set[str],
+) -> str | None:
     """Full-suite reason when a Python edit cannot be reconstructed and compiled.
 
     ``compile`` does not execute the file. A rename, deletion, mismatched hunk,
@@ -149,9 +170,15 @@ def python_risk(patch: str, changes, index: Index, validated: dict[str, str]) ->
             if old.startswith("sqlglot/"):
                 if old.endswith("/__init__.py") and not _same(_ast(original), _ast(output)):
                     return "python_package_init"
-                if any(re.match(r"\s*raise\b", line) for line in change.added_bodies):
-                    if _import_time_raises(original) != _import_time_raises(output):
-                        return "python_import_raise"
+                eager_change = any(
+                    _IMPORT_OPERATION.match(line) for line in change.added_bodies + change.removed_bodies
+                ) and _import_time_operations(original) != _import_time_operations(output)
+                if eager_change or _literal_edit(
+                    change, original, output, (index.multiline_literals or {}).get(old, ()),
+                ):
+                    if not index.import_test_files or not index.import_test_files.get(old):
+                        return "python_import_operation"
+                    import_changes.add(old)
         except (SyntaxError, ValueError):
             return "python_syntax"
         validated[old] = output
@@ -160,6 +187,13 @@ def python_risk(patch: str, changes, index: Index, validated: dict[str, str]) ->
 
 def _ast(source: str) -> ast.Module:
     return ast.parse(source, type_comments=True)
+
+
+def _boolean_flag_flip(pattern, old: str, new: str) -> bool:
+    before = pattern.fullmatch(old)
+    after = pattern.fullmatch(new)
+    return bool(before and after and before[2] != after[2]
+                and before[1] == after[1] and before[3] == after[3])
 
 
 def _same(left, right) -> bool:
@@ -357,6 +391,10 @@ class Index:
     primary: dict | None = None
     operator_lines: dict | None = None
     test_sources: dict | None = None
+    import_test_files: dict | None = None
+    multiline_literals: dict | None = None
+    expression_flag_sites: dict | None = None
+    show_flag_sites: dict | None = None
 
     @classmethod
     def load(cls, path: Path, ids: dict[str, int], sha: str) -> Index | None:
@@ -367,7 +405,9 @@ class Index:
                 return None
             return cls(data["sources"], data["lines"], set(map(ids.__getitem__, data["preserve"])),
                        data.get("tokenizer"), data.get("primary"), data.get("operator_lines"),
-                       data.get("test_sources"))
+                       data.get("test_sources"), data.get("import_test_files"),
+                       data.get("multiline_literals"), data.get("expression_flag_sites"),
+                       data.get("show_flag_sites"))
         except (OSError, EOFError, ValueError, KeyError, TypeError):
             return None
 
@@ -406,6 +446,14 @@ class Index:
                     or _detached_copy_equivalent(path, source, output, line)
                 ):
                     return set()
+                for sites, pattern in (
+                    (self.expression_flag_sites, _EXPRESSION_FLAG), (self.show_flag_sites, _SHOW_FLAG),
+                ):
+                    hits = (sites or {}).get(path, {}).get(line)
+                    if allow_equivalence and hits is not None and _boolean_flag_flip(
+                        pattern, change.removed_bodies[0], change.added_bodies[0],
+                    ):
+                        return set(hits)
                 if allow_equivalence and self.tokenizer is not None:
                     keys = _escape_keys(path, source, output, line)
                     if keys is not None:

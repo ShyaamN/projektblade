@@ -9,10 +9,158 @@ from pathlib import Path
 import subprocess
 import struct
 import zlib
+from collections import defaultdict
 
 
 ROOT = Path(__file__).resolve().parents[1]
 PINNED = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
+
+
+def import_exposure(maps, coverage):
+    """Union cold imports, warm file observations and the base import graph."""
+    with (maps / "cold-imports.json").open(encoding="utf-8") as stream:
+        cold = json.load(stream)
+    if cold["pinned_sha"] != PINNED or cold["test_ids"] != coverage["test_ids"]:
+        raise RuntimeError("Cold import inventory mismatch")
+    impact = json.loads((maps / "impact.json").read_text(encoding="utf-8"))
+    module_to_path = impact["modules"]
+    module_imports = impact["module_imports"]
+    by_module = defaultdict(set)
+    unobserved = set()
+    for test_file, loaded in cold["imports"].items():
+        if loaded is None:
+            unobserved.add(test_file)
+            continue
+        for path in loaded:
+            by_module[path].add(test_file)
+        pending = list(impact["test_file_imports"].get(test_file, ()))
+        seen = set()
+        while pending:
+            module = pending.pop()
+            if module in seen:
+                continue
+            seen.add(module)
+            if module in module_to_path:
+                by_module[module_to_path[module]].add(test_file)
+            pending.extend(module_imports.get(module, ()))
+            if "." in module:
+                pending.append(module.rsplit(".", 1)[0])
+    test_files = [node.split("::", 1)[0] for node in coverage["test_ids"]]
+    for path, bucket in coverage["files"].items():
+        for ids in bucket.values():
+            by_module[path].update(test_files[n] for n in ids)
+    return {path: sorted(files | unobserved) for path, files in by_module.items()}
+
+
+def expression_flag_sites(base, maps, trees, coverage):
+    """Index pinned expression subclasses whose schema consumers resolve by name."""
+    classes = {}
+    for path, tree in trees.items():
+        if not path.startswith("sqlglot/expressions/"):
+            continue
+        for node in tree.body:
+            if (isinstance(node, ast.ClassDef) and len(node.bases) == 1
+                    and isinstance(node.bases[0], ast.Name) and node.bases[0].id == "Expression"
+                    and not node.decorator_list and not node.keywords):
+                for stmt in node.body:
+                    if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                            and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id == "arg_types"
+                            and isinstance(stmt.value, ast.Dict) and all(
+                                isinstance(k, ast.Constant) and isinstance(k.value, str)
+                                and isinstance(v, ast.Constant) and type(v.value) is bool
+                                for k, v in zip(stmt.value.keys, stmt.value.values)
+                            )):
+                        classes[node.name] = (path, [value.lineno for value in stmt.value.values])
+
+    hits = defaultdict(set)
+    unsupported = set()
+    tests_by_file = defaultdict(list)
+    for n, node_id in enumerate(coverage["test_ids"]):
+        tests_by_file[node_id.split("::", 1)[0]].append((node_id, n))
+
+    def inspect(path, node, function=None, parents=()):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for stmt in node.body:
+                inspect(path, stmt, node.name, (*parents, node))
+            # Signature references can appear in decorators and default values.
+            for expr in [*node.decorator_list, *node.args.defaults, *node.args.kw_defaults]:
+                if expr is not None:
+                    inspect(path, expr, function, (*parents, node))
+            return
+        name = node.attr if isinstance(node, ast.Attribute) else node.id if isinstance(node, ast.Name) else None
+        if name in classes:
+            if path in tests_by_file:
+                items = tests_by_file[path]
+                matching = [n for node_id, n in items if function in node_id.split("::")[1:]]
+                hits[name].update(matching or (n for _, n in items))
+            elif function:
+                hits[name].update(coverage["files"].get(path, {}).get(str(node.lineno), ()))
+            else:
+                registration = False
+                if (len(parents) >= 2 and isinstance(parents[-1], ast.Dict)
+                        and any(node is key for key in parents[-1].keys)):
+                    stmt = parents[-2]
+                    targets = (stmt.targets if isinstance(stmt, ast.Assign)
+                               else [stmt.target] if isinstance(stmt, ast.AnnAssign) else [])
+                    registration = any(isinstance(t, ast.Name) and t.id == "PROPERTIES_LOCATION"
+                                       for t in targets)
+                if not registration:
+                    unsupported.add(name)
+        for child in ast.iter_child_nodes(node):
+            inspect(path, child, function, (*parents, node))
+
+    # Scan the entire pinned package, including files without dynamic coverage.
+    for source in (base / "sqlglot").rglob("*.py"):
+        path = source.relative_to(base).as_posix()
+        inspect(path, trees[path] if path in trees else ast.parse(source.read_text(encoding="utf-8")))
+    for path in tests_by_file:
+        source = base / path
+        if source.is_file():
+            inspect(path, ast.parse(source.read_text(encoding="utf-8")))
+
+    supplemental = json.loads((maps / "expression-instances.json").read_text(encoding="utf-8"))
+    ids = {node: i for i, node in enumerate(coverage["test_ids"])}
+    expected = {node for node in ids if "test_max_nodes" in node}
+    if supplemental["pinned_sha"] != PINNED or set(supplemental["constructed"]) != expected:
+        raise RuntimeError("Expression instance inventory mismatch")
+    for node, names in supplemental["constructed"].items():
+        for name in names:
+            hits[name].add(ids[node])
+
+    sites = defaultdict(dict)
+    for name, (path, lines) in classes.items():
+        if name not in unsupported and hits[name]:
+            sites[path].update((line, sorted(hits[name])) for line in lines)
+    return dict(sites)
+
+
+def show_flag_sites(maps, coverage, trees):
+    data = json.loads((maps / "show-dispatch.json").read_text(encoding="utf-8"))
+    if data["pinned_sha"] != PINNED or data["test_ids"] != coverage["test_ids"]:
+        raise RuntimeError("SHOW dispatch inventory mismatch")
+    ids = {node: i for i, node in enumerate(coverage["test_ids"])}
+    unobserved = {ids[node] for node in data["unobserved"]}
+    sites = defaultdict(dict)
+    for path, observations in data["keys"].items():
+        if path not in trees:
+            continue
+        for cls in trees[path].body:
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            for stmt in cls.body:
+                if not (isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Dict)
+                        and any(isinstance(t, ast.Name) and t.id == "SHOW_PARSERS" for t in stmt.targets)):
+                    continue
+                for key, value in zip(stmt.value.keys, stmt.value.values):
+                    if (isinstance(key, ast.Constant) and isinstance(key.value, str)
+                            and isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+                            and value.func.id == "_show_parser" and any(
+                                kw.arg == "target" and isinstance(kw.value, ast.Constant)
+                                and type(kw.value.value) is bool for kw in value.keywords
+                            )):
+                        hits = {ids[node] for node in observations.get(key.value, ())}
+                        sites[path][key.lineno] = sorted(unobserved | hits)
+    return dict(sites)
 
 
 def main():
@@ -47,8 +195,9 @@ def main():
     preserve.update(test for test in coverage["test_ids"] if "test_max_nodes" in test)
     lines = {}
     operator_lines = {}
-    for path, source in sources.items():
-        tree = ast.parse(source)
+    multiline_literals = {}
+    trees = {path: ast.parse(source) for path, source in sources.items()}
+    for path, tree in trees.items():
         keep = {
             str(node.test.lineno if isinstance(node, ast.If) else node.lineno)
             for node in ast.walk(tree)
@@ -66,6 +215,14 @@ def main():
         })
         if checked:
             operator_lines[path] = checked
+        spans = sorted({
+            (node.lineno, node.end_lineno) for node in ast.walk(tree)
+            if (isinstance(node, ast.JoinedStr)
+                or isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)))
+            and node.end_lineno > node.lineno
+        })
+        if spans:
+            multiline_literals[path] = spans
     with gzip.open(maps / "coverage.json.gz", "rt", encoding="utf-8") as stream:
         primary = json.load(stream)
     if primary["pinned_sha"] != PINNED or primary["test_ids"] != coverage["test_ids"]:
@@ -87,6 +244,10 @@ def main():
         "preserve": sorted(preserve),
         "primary": primary,
         "operator_lines": operator_lines,
+        "import_test_files": import_exposure(maps, coverage),
+        "multiline_literals": multiline_literals,
+        "expression_flag_sites": expression_flag_sites(base, maps, trees, coverage),
+        "show_flag_sites": show_flag_sites(maps, coverage, trees),
         "test_sources": {
             path: zlib.compress((base / path).read_text(encoding="utf-8").encode())
             for path in sorted({node.split("::", 1)[0] for node in coverage["test_ids"]})

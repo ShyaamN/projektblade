@@ -69,6 +69,21 @@ def main() -> int:
     selected_import = choose(patch_for(path, original, raises), loaded)
     assert selected_import.force_all and selected_import.numbers == numbers, selected_import.reasons
 
+    core = "sqlglot/expressions/core.py"
+    core_source = pinpoint.sources[core]
+    missing_import = core_source.replace(
+        "import datetime\n", "import projektblade_holdout_missing_module\nimport datetime\n", 1
+    )
+    assert missing_import != core_source
+    compile(missing_import, core, "exec")
+    import_patch = patch_for(core, core_source, missing_import)
+    affected_parser_test = loaded[3]["tests/test_parser.py::TestParser::test_union"]
+    selected_core = choose(import_patch, loaded)
+    assert affected_parser_test in selected_core.numbers, selected_core.reasons
+
+    quoted = 'diff --git "a/sqlglot/a b.py" "b/sqlglot/a b.py"\n'
+    assert choose(import_patch + quoted, loaded).force_all
+
     test_path = "tests/test_parser.py"
     test_source = zlib.decompress(pinpoint.test_sources[test_path]).decode("utf-8")
     method = next(
